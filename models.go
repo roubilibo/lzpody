@@ -235,6 +235,22 @@ func networkItem(raw map[string]any) Item {
 	return Item{Kind: "network", ID: name, Name: name, State: "network", Status: driver, Details: raw}
 }
 
+func secretItem(raw map[string]any) Item {
+	id := defaultText(raw["ID"], raw["Id"])
+	name := defaultText(raw["Name"], raw["name"])
+	if name == "" {
+		name = shortID(id)
+	}
+	driver := "file"
+	if spec, ok := raw["Spec"].(map[string]any); ok {
+		driver = defaultText(spec["Driver"], driver)
+		if driverObject, ok := spec["Driver"].(map[string]any); ok {
+			driver = defaultText(driverObject["Name"], driver)
+		}
+	}
+	return Item{Kind: "secret", ID: id, Name: name, State: "secret", Status: driver, Details: raw}
+}
+
 func defaultText(value any, fallback any) string {
 	text := scalarText(value)
 	if text == "" || text == "<nil>" {

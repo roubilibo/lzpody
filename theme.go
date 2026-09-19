@@ -23,7 +23,7 @@ var defaultThemeColors = map[string]string{
 type UITheme struct {
 	Name                                             string
 	Normal, Title, Selected, Muted, Running, Stopped lipgloss.Style
-	Error, Border, Key                               lipgloss.Style
+	Error, Border, Key, KeySelected                  lipgloss.Style
 }
 
 func colorStyle(foreground, background string, bold bool) lipgloss.Style {
@@ -86,15 +86,16 @@ func loadUITheme() UITheme {
 		name = strings.Title(strings.ReplaceAll(themeID, "-", " "))
 	}
 	return UITheme{
-		Name:     name,
-		Normal:   colorStyle(colors["foreground"], "", false),
-		Title:    colorStyle(colors["accent"], "", true),
-		Selected: colorStyle(colors["foreground"], colors["selection"], false),
-		Muted:    colorStyle(colors["muted"], "", false),
-		Running:  colorStyle(colors["green"], "", true),
-		Stopped:  colorStyle(colors["muted"], "", false),
-		Error:    colorStyle(colors["red"], "", true),
-		Border:   colorStyle(colors["muted"], "", false),
-		Key:      colorStyle(colors["yellow"], "", true),
+		Name:        name,
+		Normal:      colorStyle(colors["foreground"], "", false),
+		Title:       colorStyle(colors["accent"], "", true),
+		Selected:    colorStyle(colors["foreground"], colors["selection"], false),
+		Muted:       colorStyle(colors["muted"], "", false),
+		Running:     colorStyle(colors["green"], "", true),
+		Stopped:     colorStyle(colors["muted"], "", false),
+		Error:       colorStyle(colors["red"], "", true),
+		Border:      colorStyle(colors["muted"], "", false),
+		Key:         colorStyle(colors["yellow"], "", true),
+		KeySelected: colorStyle(colors["yellow"], colors["selection"], true),
 	}
 }

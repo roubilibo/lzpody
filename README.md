@@ -20,6 +20,11 @@ https://github.com/user-attachments/assets/be54a50e-2339-49b2-852a-880f9aa18df1
 - Native rootless Libpod API over the Podman Unix socket.
 - Containers, Pods, Images, Volumes, and Networks views.
 - Lazydocker-style stacked resource panels, focused detail view.
+- Libpod actions for pulling/building/pushing/pruning images, image history,
+  tag/untag, registry search, save/load/import, registry login/logout, creating and
+  running containers, managing pods/volumes/networks, executing commands, and
+  copying files.
+- System information and recent Podman events in the detail panel.
 - A single Go binary with no runtime dependencies beyond Podman and a Unix socket.
 
 ## Run
@@ -70,6 +75,11 @@ LZPODY_SOCKET=/path/to/podman.sock ./lzpody
 
 ## 1. Navigation
 
+ Mouse input is enabled in supported terminals. Click a panel or item to focus
+it, click a detail tab to open it, click menu entries to activate them, and use
+the scroll wheel over a panel or detail view to navigate. Right-click an item
+or the detail view to open its resource-specific context menu.
+
 | Shortcut | Action |
 |---|---|
 | `↑` / `↓` | Select previous / next item |
@@ -77,7 +87,7 @@ LZPODY_SOCKET=/path/to/podman.sock ./lzpody
 | `←` / `→` | Switch resource panels |
 | `h` / `l` | Switch resource panels |
 | `Tab` | Move to the next panel |
-| `1` – `5` | Focus a specific resource panel |
+| `1` – `6` | Focus a specific resource panel |
 | `Enter` | Open the main detail view |
 | `Esc` | Return to resource panels |
 
@@ -116,7 +126,7 @@ Container shortcuts follow LazyDocker conventions.
 | `r` | Restart | Restart a container |
 | `m` | Logs | Open container logs |
 | `a` | Attach | Attach to a container |
-| `E` | Shell | Open a shell inside a container |
+| `E` | Shell | Open an embedded shell inside a container; `Esc` closes it |
 | `d` | Remove | Remove a container |
 | `i` | Config | Show container configuration |
 | `t` | Stats | Show container statistics |
@@ -128,7 +138,40 @@ Container shortcuts follow LazyDocker conventions.
 |---|---|
 | `/` | Filter items |
 | `F5` | Refresh resources |
+| `P` | Pull image |
+| `B` | Build image |
+| `U` | Push image |
+| `C` | Create and run container |
 | `q` | Quit application |
+
+## 6. Libpod actions
+
+Open `x` or `?` for the complete action menu. Actions that need values open an
+input overlay; use `|` to separate values:
+
+| Action | Input format |
+|---|---|
+| Pull image | `image-reference` (live layer progress is shown in the detail panel) |
+| Create and run container | Tabbed form: Basic, Network, Runtime, and Security; fields can be revisited without a linear wizard |
+| Create secret | `secret-name`, then a local secret file path |
+| Build image | `context-directory \| image-tag` |
+| System prune | `YES \| all \| volumes \| build \| filters` (filters comma-separated, e.g. `until=24h,label=app=demo`) |
+| Push image | `local-image \| registry-destination` |
+| Tag image | Select an image, then `repository \| tag` |
+| Search registry | `search-term \| limit` |
+| Save image | Select an image, then a `.tar` destination path |
+| Load/import image | A local `.tar` path, with optional import reference |
+| Registry login/logout | Registry credentials (password is masked), or `ALL` to log out everywhere |
+| Execute command | `command` |
+| Copy to container | `local-file \| container-path` |
+| Copy from container | `container-path \| local-path` |
+| Create pod/volume/network | Network form also accepts driver, subnet, gateway, IP range, IPv6, internal, labels, and driver options |
+| Connect/disconnect network | `container-name-or-id` |
+| Relationships | Select a container, pod, volume, or network and open `Relationships` to see links and usage |
+| Prune images | type `YES` |
+
+The menu also exposes volume mount/unmount, System info, and Events. Events are
+polled through the native Libpod API while the detail panel is open.
 
 ---
 

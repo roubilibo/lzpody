@@ -19,6 +19,7 @@ type bubbleActionMsg struct {
 	action string
 	itemID string
 	name   string
+	output string
 	err    error
 }
 
@@ -27,6 +28,8 @@ type bubbleExternalMsg struct {
 	action string
 	err    error
 }
+
+type cursorBlinkMsg struct{}
 
 type Model struct {
 	app          *App
@@ -45,7 +48,13 @@ func newBubbleModel(app *App) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.immediateRefreshCmd(), m.refreshCmd())
+	return tea.Batch(m.immediateRefreshCmd(), m.refreshCmd(), cursorBlinkCmd())
+}
+
+func cursorBlinkCmd() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg {
+		return cursorBlinkMsg{}
+	})
 }
 
 func (m Model) refreshCmd() tea.Cmd {
@@ -72,15 +81,22 @@ func (m Model) immediateRefreshCmdWithStatus(status string) tea.Cmd {
 
 func (m Model) detailCmd() tea.Cmd {
 	item := m.app.current()
-	if item == nil {
+	if item == nil && m.app.DetailMode != "system" && m.app.DetailMode != "events" {
 		return nil
 	}
 	client := m.app.Client
-	itemCopy := *item
+	itemCopy := Item{}
+	if item != nil {
+		itemCopy = *item
+	}
 	mode := m.app.DetailMode
 	history := append([]map[string]any(nil), m.app.StatsHistory[item.ID]...)
+	m.app.DetailRequestID++
+	requestID := m.app.DetailRequestID
 	return func() tea.Msg {
-		return bubbleDetailMsg{result: fetchDetail(client, itemCopy, mode, history)}
+		result := fetchDetail(client, itemCopy, mode, history)
+		result.requestID = requestID
+		return bubbleDetailMsg{result: result}
 	}
 }
 

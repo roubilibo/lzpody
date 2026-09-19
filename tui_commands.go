@@ -12,11 +12,7 @@ func (m Model) external(action string) tea.Cmd {
 		return nil
 	}
 	var command *exec.Cmd
-	if action == "shell" {
-		command = exec.Command("podman", "exec", "-it", item.Name, "sh")
-	} else {
-		command = exec.Command("podman", "attach", item.Name)
-	}
+	command = exec.Command("podman", "attach", item.Name)
 	itemID := item.ID
 	return tea.ExecProcess(command, func(err error) tea.Msg {
 		if _, exited := err.(*exec.ExitError); exited {
@@ -28,6 +24,6 @@ func (m Model) external(action string) tea.Cmd {
 func runBubbleTUI(client *PodmanClient) error {
 	app := NewApp(client)
 	model := newBubbleModel(app)
-	_, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
+	_, err := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
 	return err
 }

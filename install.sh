@@ -17,7 +17,12 @@ case "$(uname -m)" in
   *) echo "lzpody installer: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-RELEASE_BASE_URL=${LZPODY_RELEASE_BASE_URL:-"https://github.com/roubilibo/lzpody/releases/download/$VERSION"}
+if [ "$VERSION" = "latest" ]; then
+  DEFAULT_RELEASE_BASE_URL="https://github.com/roubilibo/lzpody/releases/latest/download"
+else
+  DEFAULT_RELEASE_BASE_URL="https://github.com/roubilibo/lzpody/releases/download/$VERSION"
+fi
+RELEASE_BASE_URL=${LZPODY_RELEASE_BASE_URL:-$DEFAULT_RELEASE_BASE_URL}
 RELEASE_BASE_URL=${RELEASE_BASE_URL%/}
 if [ -n "${LZPODY_BINARY_URL:-}" ]; then
   BINARY_URL=$LZPODY_BINARY_URL

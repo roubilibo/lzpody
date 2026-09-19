@@ -38,7 +38,7 @@ the downloaded binary directly.
 Install to `~/.local/bin` with curl:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roubilibo/lzpody/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roubilibo/lzpody/master/install.sh | bash
 ```
 
 The installer is dependency-light: it downloads the platform binary and

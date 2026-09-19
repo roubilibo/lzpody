@@ -151,3 +151,7 @@ GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o lzpody-linux-amd6
 
 Pushing a `v*` tag runs the release workflow and publishes the three Linux
 assets consumed by `install.sh`.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

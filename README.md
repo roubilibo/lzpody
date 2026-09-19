@@ -95,10 +95,11 @@ and navigation model.
 
 ## Omarchy appearance
 
-The TUI reads the active Omarchy theme name from
-`~/.local/state/omarchy/current/theme.name` and displays it in the header. The
-terminal's existing color profile is preserved, so it remains usable outside
-Omarchy as well.
+The TUI reads the active Omarchy palette from
+`~/.config/omarchy/themes/<active-theme>/colors.toml` and applies the
+foreground, accent, selection, muted, green, red, and yellow colors to the
+panels, focus state, actions, and status line. It falls back to the bundled
+Akane-compatible palette when Omarchy is unavailable.
 
 ## Development
 

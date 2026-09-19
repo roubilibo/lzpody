@@ -16,7 +16,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -28,6 +30,146 @@ var resourceModes = []string{"containers", "pods", "images", "volumes", "network
 var resourceLabels = map[string]string{
 	"containers": "Containers", "pods": "Pods", "images": "Images",
 	"volumes": "Volumes", "networks": "Networks",
+}
+
+var defaultThemeColors = map[string]string{
+	"background": "#12101c",
+	"foreground": "#f0c4a8",
+	"accent":     "#e15a48",
+	"selection":  "#2c2438",
+	"muted":      "#6d5a68",
+	"green":      "#7e9a6a",
+	"red":        "#d6453d",
+	"cyan":       "#4a9bb0",
+	"yellow":     "#f0b45a",
+}
+
+type UITheme struct {
+	Name, Normal, Title, Selected, Muted, Running, Stopped, Error, Border, Key string
+}
+
+type textRegion struct {
+	start, end int
+	style      string
+}
+
+func addRegion(regions [][]textRegion, row, start, end int, style string) {
+	if row < 0 || row >= len(regions) || start >= end || style == "" {
+		return
+	}
+	regions[row] = append(regions[row], textRegion{start: start, end: end, style: style})
+}
+
+func styleLine(line, base string, regions []textRegion) string {
+	runes := []rune(line)
+	if len(runes) == 0 {
+		return base + "\x1b[0m"
+	}
+	styles := make([]string, len(runes))
+	for index := range styles {
+		styles[index] = base
+	}
+	for _, region := range regions {
+		start := max(0, region.start)
+		end := min(len(runes), region.end)
+		for index := start; index < end; index++ {
+			styles[index] = region.style
+		}
+	}
+	var output strings.Builder
+	start := 0
+	for start < len(runes) {
+		style := styles[start]
+		end := start + 1
+		for end < len(runes) && styles[end] == style {
+			end++
+		}
+		output.WriteString(style)
+		output.WriteString(string(runes[start:end]))
+		output.WriteString("\x1b[0m")
+		start = end
+	}
+	return output.String()
+}
+
+func ansiColor(hex string, background bool, bold bool) string {
+	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+	if len(hex) != 6 {
+		return ""
+	}
+	red, redErr := strconv.ParseInt(hex[0:2], 16, 32)
+	green, greenErr := strconv.ParseInt(hex[2:4], 16, 32)
+	blue, blueErr := strconv.ParseInt(hex[4:6], 16, 32)
+	if redErr != nil || greenErr != nil || blueErr != nil {
+		return ""
+	}
+	base := 38
+	if background {
+		base = 48
+	}
+	if bold {
+		return fmt.Sprintf("\x1b[1;%d;2;%d;%d;%dm", base, red, green, blue)
+	}
+	return fmt.Sprintf("\x1b[%d;2;%d;%d;%dm", base, red, green, blue)
+}
+
+func loadUITheme() UITheme {
+	colors := make(map[string]string, len(defaultThemeColors))
+	for key, value := range defaultThemeColors {
+		colors[key] = value
+	}
+	themeID := ""
+	statePath := filepath.Join(os.Getenv("HOME"), ".local/state/omarchy/current/theme.name")
+	if data, err := os.ReadFile(statePath); err == nil {
+		themeID = strings.TrimSpace(string(data))
+	}
+	if themeID != "" {
+		candidates := []string{
+			filepath.Join(os.Getenv("HOME"), ".config/omarchy/themes", themeID, "colors.toml"),
+			filepath.Join(os.Getenv("OMARCHY_PATH"), "themes", themeID, "colors.toml"),
+		}
+		if os.Getenv("OMARCHY_PATH") == "" {
+			candidates[1] = filepath.Join("/usr/share/omarchy", "themes", themeID, "colors.toml")
+		}
+		for _, candidate := range candidates {
+			data, err := os.ReadFile(candidate)
+			if err != nil {
+				continue
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				trimmedLine := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmedLine, "#") {
+					continue
+				}
+				keyValue := strings.SplitN(trimmedLine, "=", 2)
+				if len(keyValue) != 2 {
+					continue
+				}
+				key := strings.TrimSpace(keyValue[0])
+				value := strings.Trim(strings.TrimSpace(keyValue[1]), "\"")
+				if _, known := colors[key]; known && len(value) == 7 && strings.HasPrefix(value, "#") {
+					colors[key] = value
+				}
+			}
+			break
+		}
+	}
+	name := "Omarchy"
+	if themeID != "" {
+		name = strings.Title(strings.ReplaceAll(themeID, "-", " "))
+	}
+	return UITheme{
+		Name:     name,
+		Normal:   ansiColor(colors["foreground"], false, false),
+		Title:    ansiColor(colors["accent"], false, true),
+		Selected: ansiColor(colors["foreground"], false, false) + ansiColor(colors["selection"], true, false),
+		Muted:    ansiColor(colors["muted"], false, false),
+		Running:  ansiColor(colors["green"], false, true),
+		Stopped:  ansiColor(colors["muted"], false, false),
+		Error:    ansiColor(colors["red"], false, true),
+		Border:   ansiColor(colors["muted"], false, false),
+		Key:      ansiColor(colors["yellow"], false, true),
+	}
 }
 
 type PodmanError struct{ Message string }
@@ -64,12 +206,15 @@ func NewPodmanClient(socketPath string) *PodmanClient {
 	return &PodmanClient{
 		SocketPath: socketPath,
 		APIRoot:    "/" + strings.Trim(version, "/") + "/libpod",
-		HTTP: &http.Client{Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", socketPath)
+		HTTP: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", socketPath)
+				},
 			},
-		}},
+		},
 	}
 }
 
@@ -561,21 +706,22 @@ func statsLines(history []map[string]any) []string {
 }
 
 type App struct {
-	Client       *PodmanClient
-	Mode         string
-	Items        map[string][]Item
-	Selected     map[string]int
-	DetailMode   string
-	DetailLines  []string
-	StatsHistory map[string][]map[string]any
-	Filter       string
-	HideStopped  bool
-	Status       string
-	LastRefresh  time.Time
-	DetailScroll int
-	FocusMain    bool
-	MenuOpen     bool
-	MenuIndex    int
+	Client         *PodmanClient
+	Mode           string
+	Items          map[string][]Item
+	Selected       map[string]int
+	DetailMode     string
+	DetailLines    []string
+	StatsHistory   map[string][]map[string]any
+	Filter         string
+	HideStopped    bool
+	Status         string
+	LastRefresh    time.Time
+	DetailScroll   int
+	DetailViewRows int
+	FocusMain      bool
+	MenuOpen       bool
+	MenuIndex      int
 }
 
 func NewApp(client *PodmanClient) *App {
@@ -659,11 +805,11 @@ func (a *App) refresh(keepID string) {
 		case "summary":
 			a.loadSummary()
 		case "logs":
-			a.loadLogs()
+			a.loadLogs(true)
 		case "stats":
-			a.loadStats()
+			a.loadStats(true)
 		case "top":
-			a.loadTop()
+			a.loadTop(true)
 		}
 	}
 }
@@ -704,7 +850,7 @@ func (a *App) loadSummary() {
 	a.DetailScroll = 0
 }
 
-func (a *App) loadLogs() {
+func (a *App) loadLogs(silent ...bool) {
 	item := a.current()
 	if item == nil || item.Kind != "container" {
 		return
@@ -716,10 +862,13 @@ func (a *App) loadLogs() {
 	}
 	a.DetailLines = splitLines(value, "(no logs)")
 	a.DetailMode = "logs"
+	if len(silent) == 0 || !silent[0] {
+		a.DetailScroll = 0
+	}
 	a.Status = "Logs: " + item.Name
 }
 
-func (a *App) loadStats() {
+func (a *App) loadStats(silent ...bool) {
 	item := a.current()
 	if item == nil || (item.Kind != "container" && item.Kind != "pod") {
 		return
@@ -746,6 +895,9 @@ func (a *App) loadStats() {
 		a.DetailLines = []string{"No statistics available."}
 	}
 	a.DetailMode = "stats"
+	if len(silent) == 0 || !silent[0] {
+		a.DetailScroll = 0
+	}
 	a.Status = "Stats: " + item.Name
 }
 
@@ -771,6 +923,7 @@ func (a *App) loadInspect(mode string) {
 	encoded, _ := json.MarshalIndent(value, "", "  ")
 	a.DetailLines = strings.Split(string(encoded), "\n")
 	a.DetailMode = mode
+	a.DetailScroll = 0
 	a.Status = strings.Title(mode) + ": " + item.Name
 }
 
@@ -799,10 +952,11 @@ func (a *App) loadEnv() {
 	}
 	a.DetailLines = lines
 	a.DetailMode = "env"
+	a.DetailScroll = 0
 	a.Status = "Environment: " + item.Name
 }
 
-func (a *App) loadTop() {
+func (a *App) loadTop(silent ...bool) {
 	item := a.current()
 	if item == nil || item.Kind != "container" {
 		return
@@ -838,6 +992,9 @@ func (a *App) loadTop() {
 	}
 	a.DetailLines = lines
 	a.DetailMode = "top"
+	if len(silent) == 0 || !silent[0] {
+		a.DetailScroll = 0
+	}
 	a.Status = "Top: " + item.Name
 }
 
@@ -910,6 +1067,10 @@ func (a *App) moveFocus(delta int) {
 	a.loadSummary()
 }
 func (a *App) toggleMode(mode string) {
+	if a.Mode == mode {
+		a.FocusMain = false
+		return
+	}
 	a.Mode = mode
 	a.FocusMain = false
 	a.DetailMode = "summary"
@@ -1028,6 +1189,13 @@ func isTTY() bool {
 }
 
 func terminalSize() (int, int) {
+	type windowSize struct {
+		rows, columns, horizontal, vertical uint16
+	}
+	var size windowSize
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdout.Fd(), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&size))); errno == 0 && size.columns > 0 && size.rows > 0 {
+		return int(size.columns), int(size.rows)
+	}
 	columns, _ := strconv.Atoi(os.Getenv("COLUMNS"))
 	rows, _ := strconv.Atoi(os.Getenv("LINES"))
 	if columns < 70 {
@@ -1073,17 +1241,26 @@ func boxLine(width int, left, right rune) string {
 
 func (a *App) render() {
 	width, height := terminalSize()
+	uiTheme := loadUITheme()
 	lines := make([]string, height)
+	styles := make([]string, height)
+	regions := make([][]textRegion, height)
 	for i := range lines {
 		lines[i] = strings.Repeat(" ", width)
+		styles[i] = uiTheme.Normal
 	}
 	if height < 22 || width < 70 {
 		lines[0] = clip("Terminal too small. Minimum size is 70x22.", width)
-		fmt.Print("\x1b[H\x1b[2J" + strings.Join(lines, "\r\n"))
+		printFrame(lines, styles, regions)
 		return
 	}
-	putLine(lines, 0, 1, width-2, "lzpody   native Libpod · "+themeName())
+	putLine(lines, 0, 0, width, " lzpody ")
+	putLine(lines, 0, 14, width-14, "native Libpod · "+uiTheme.Name)
+	addRegion(regions, 0, 0, 9, uiTheme.Title)
+	addRegion(regions, 0, 14, width, uiTheme.Muted)
+	styles[0] = uiTheme.Normal
 	putLine(lines, 1, width-27, 25, "[F5] refresh  [q] quit")
+	styles[1] = uiTheme.Muted
 	if a.Filter != "" {
 		putLine(lines, 1, 1, width/2, "Filter: "+a.Filter)
 	}
@@ -1099,13 +1276,23 @@ func (a *App) render() {
 		if index == len(resourceModes)-1 {
 			panelH = bottom - panelTop + 1
 		}
+		panelStyle := uiTheme.Border
+		if mode == a.Mode && !a.FocusMain {
+			panelStyle = uiTheme.Title
+		}
+		addRegion(regions, panelTop, 1, leftWidth+1, panelStyle)
 		putLine(lines, panelTop, 1, leftWidth, boxLine(leftWidth, '┌', '┐'))
 		putLine(lines, panelTop, 3, leftWidth-4, fmt.Sprintf("[%d] %s (%d)", index+1, resourceLabels[mode], len(a.Items[mode])))
+		styles[panelTop] = panelStyle
 		for r := 1; r < panelH-1; r++ {
 			putLine(lines, panelTop+r, 1, leftWidth, "│")
 			putLine(lines, panelTop+r, leftWidth, 1, "│")
+			addRegion(regions, panelTop+r, 1, leftWidth+1, panelStyle)
+			styles[panelTop+r] = panelStyle
 		}
 		putLine(lines, panelTop+panelH-1, 1, leftWidth, boxLine(leftWidth, '└', '┘'))
+		addRegion(regions, panelTop+panelH-1, 1, leftWidth+1, panelStyle)
+		styles[panelTop+panelH-1] = panelStyle
 		visible := max(1, panelH-2)
 		selected := a.Selected[mode]
 		start := max(0, min(selected-visible+1, len(a.Items[mode])-visible))
@@ -1115,7 +1302,7 @@ func (a *App) render() {
 				marker = "◆"
 			} else if item.Kind == "volume" || item.Kind == "network" {
 				marker = "◇"
-			} else if isRunning(item.State) {
+			} else if strings.EqualFold(item.State, "running") || strings.EqualFold(item.State, "running (healthy)") {
 				marker = "●"
 			}
 			label := marker + " " + item.Name + "  " + item.State
@@ -1123,62 +1310,151 @@ func (a *App) render() {
 				label = marker + " " + item.Name + "  " + containerStateLabel(item) + fmt.Sprintf("  %5.2f%%", item.CPU)
 			}
 			if item.Kind == "image" {
-				label = marker + " " + shortID(item.Name) + "  " + defaultText(item.Status, "unknown size")
+				imageName := item.Name
+				if slash := strings.LastIndex(imageName, "/"); slash >= 0 {
+					imageName = imageName[slash+1:]
+				}
+				label = marker + " " + imageName + "  " + defaultText(item.Status, "unknown size")
 			}
 			if start+row == selected && mode == a.Mode && !a.FocusMain {
 				label = "> " + label
 			}
 			putLine(lines, panelTop+1+row, 2, leftWidth-3, label)
+			itemStyle := uiTheme.Stopped
+			if strings.ToLower(item.State) == "running" {
+				itemStyle = uiTheme.Running
+			}
+			if start+row == selected && mode == a.Mode && !a.FocusMain {
+				itemStyle = uiTheme.Selected
+			}
+			addRegion(regions, panelTop+1+row, 1, leftWidth+1, itemStyle)
+			styles[panelTop+1+row] = itemStyle
+		}
+		if len(a.Items[mode]) == 0 && panelH >= 4 {
+			putLine(lines, panelTop+1, 3, leftWidth-4, "(empty)")
+			addRegion(regions, panelTop+1, 1, leftWidth+1, uiTheme.Muted)
 		}
 	}
+	for row := top; row <= bottom; row++ {
+		addRegion(regions, row, rightX, rightX+rightWidth, uiTheme.Border)
+	}
 	putLine(lines, top, rightX, rightWidth, boxLine(rightWidth, '┌', '┐'))
+	mainStyle := uiTheme.Border
+	if a.FocusMain {
+		mainStyle = uiTheme.Title
+	}
+	styles[top] = mainStyle
 	for r := 1; r < bottom-top; r++ {
 		putLine(lines, top+r, rightX, 1, "│")
 		putLine(lines, top+r, rightX+rightWidth-1, 1, "│")
+		styles[top+r] = mainStyle
 	}
 	putLine(lines, bottom, rightX, rightWidth, boxLine(rightWidth, '└', '┘'))
+	styles[bottom] = mainStyle
 	item := a.current()
 	title := "Details"
 	if item != nil {
 		title = item.Name
 	}
-	putLine(lines, top, rightX+2, rightWidth-4, title+" ["+a.DetailMode+"]")
+	position := ""
+	if len(a.DetailLines) > 0 {
+		first := a.DetailScroll + 1
+		last := min(len(a.DetailLines), a.DetailScroll+max(1, bottom-top-2))
+		position = fmt.Sprintf("  (%d-%d/%d)", first, last, len(a.DetailLines))
+	}
+	putLine(lines, top, rightX+2, rightWidth-4, title+" ["+a.DetailMode+"]"+position)
+	addRegion(regions, top, rightX, rightX+rightWidth, uiTheme.Title)
+	styles[top] = uiTheme.Title
 	tabs := []string{}
 	for _, tab := range a.detailTabs() {
+		label := strings.Title(tab)
 		if tab == a.DetailMode {
-			tabs = append(tabs, "["+tab+"]")
+			tabs = append(tabs, "["+label+"]")
 		} else {
-			tabs = append(tabs, tab)
+			tabs = append(tabs, label)
 		}
 	}
 	putLine(lines, top+1, rightX+2, rightWidth-4, strings.Join(tabs, "  "))
+	addRegion(regions, top+1, rightX, rightX+rightWidth, uiTheme.Key)
+	styles[top+1] = uiTheme.Key
 	detailRows := bottom - top - 2
+	a.DetailViewRows = max(1, detailRows)
 	start := max(0, min(a.DetailScroll, max(0, len(a.DetailLines)-detailRows)))
 	for index, line := range a.DetailLines[start:min(start+detailRows, len(a.DetailLines))] {
 		putLine(lines, top+2+index, rightX+2, rightWidth-4, line)
+		addRegion(regions, top+2+index, rightX, rightX+rightWidth, uiTheme.Normal)
+		styles[top+2+index] = uiTheme.Normal
 	}
 	putLine(lines, height-2, 1, width-2, a.Status)
-	footer := "←/→ h/l panels  ↑/↓ j/k items  Tab  1-5  Enter detail  x/? menu  / filter  q quit"
+	statusLower := strings.ToLower(a.Status)
+	if strings.Contains(statusLower, "error") || strings.Contains(statusLower, "cannot") || strings.Contains(statusLower, "not found") || strings.Contains(statusLower, "invalid") || strings.Contains(statusLower, "api 4") || strings.Contains(statusLower, "api 5") {
+		styles[height-2] = uiTheme.Error
+	} else {
+		styles[height-2] = uiTheme.Muted
+	}
+	footer := "←/→ h/l panels  ↑/↓ j/k items  Tab  1-5 focus  Enter main  [/] tabs  x/? menu  / filter  q quit"
 	if a.FocusMain {
-		footer = "↑/↓ j/k scroll  PgUp/PgDn  [/] tabs  Esc panels  x/? menu  q quit"
+		footer = "↑/↓ j/k scroll  PgUp/PgDn Ctrl-U/D  Home/End  [/] tabs  Esc panels  x/? menu  q quit"
 	}
 	if a.MenuOpen {
 		footer = "↑/↓ j/k select  Enter choose  Esc close menu"
 	}
 	putLine(lines, height-1, 1, width-2, footer)
+	styles[height-1] = uiTheme.Key
 	if a.MenuOpen {
 		entries := a.menuEntries()
-		start := max(0, min(a.MenuIndex-8, len(entries)-9))
-		putLine(lines, top+3, rightX+4, rightWidth-8, "ACTIONS")
-		for index, entry := range entries[start:min(start+9, len(entries))] {
-			prefix := "  "
+		boxWidth := min(42, max(24, width-6))
+		boxHeight := min(len(entries)+2, max(5, height-4))
+		menuTop := max(1, (height-boxHeight)/2)
+		menuLeft := max(2, (width-boxWidth)/2)
+		menuStyle := uiTheme.Title
+		putLine(lines, menuTop, menuLeft, boxWidth, boxLine(boxWidth, '┌', '┐'))
+		addRegion(regions, menuTop, menuLeft, menuLeft+boxWidth, menuStyle)
+		styles[menuTop] = menuStyle
+		for row := 1; row < boxHeight-1; row++ {
+			putLine(lines, menuTop+row, menuLeft, boxWidth, "│"+strings.Repeat(" ", boxWidth-2)+"│")
+			addRegion(regions, menuTop+row, menuLeft, menuLeft+boxWidth, uiTheme.Normal)
+			styles[menuTop+row] = uiTheme.Normal
+		}
+		putLine(lines, menuTop+boxHeight-1, menuLeft, boxWidth, boxLine(boxWidth, '└', '┘'))
+		addRegion(regions, menuTop+boxHeight-1, menuLeft, menuLeft+boxWidth, menuStyle)
+		styles[menuTop+boxHeight-1] = menuStyle
+		putLine(lines, menuTop, menuLeft+2, boxWidth-4, "Actions")
+		styles[menuTop] = menuStyle
+		visible := max(1, boxHeight-2)
+		start := max(0, min(a.MenuIndex-visible+1, len(entries)-visible))
+		for index, entry := range entries[start:min(start+visible, len(entries))] {
+			row := menuTop + 1 + index
+			putLine(lines, row, menuLeft+2, boxWidth-4, entry[0])
 			if start+index == a.MenuIndex {
-				prefix = "> "
+				styles[row] = uiTheme.Selected
+				addRegion(regions, row, menuLeft+2, menuLeft+boxWidth-2, uiTheme.Selected)
+			} else {
+				styles[row] = uiTheme.Normal
+				addRegion(regions, row, menuLeft+2, menuLeft+boxWidth-2, uiTheme.Normal)
 			}
-			putLine(lines, top+4+index, rightX+4, rightWidth-8, prefix+entry[0])
 		}
 	}
-	fmt.Print("\x1b[H\x1b[2J" + strings.Join(lines, "\r\n"))
+	printFrame(lines, styles, regions)
+}
+
+func printFrame(lines, styles []string, regions [][]textRegion) {
+	var frame strings.Builder
+	for index, line := range lines {
+		base := ""
+		if index < len(styles) {
+			base = styles[index]
+		}
+		var rowRegions []textRegion
+		if index < len(regions) {
+			rowRegions = regions[index]
+		}
+		frame.WriteString(styleLine(line, base, rowRegions))
+		if index < len(lines)-1 {
+			frame.WriteString("\r\n")
+		}
+	}
+	fmt.Print("\x1b[H\x1b[2J" + frame.String())
 }
 
 func themeName() string {
@@ -1211,6 +1487,8 @@ func readKey() (string, error) {
 	switch one[0] {
 	case 'q':
 		return "q", nil
+	case 'y', 'Y':
+		return "y", nil
 	case 3:
 		return "q", nil
 	case 10, 13:
@@ -1259,6 +1537,8 @@ func readKey() (string, error) {
 			return "pageup", nil
 		case "[6~":
 			return "pagedown", nil
+		case "[Z":
+			return "backtab", nil
 		case "[15~":
 			return "refresh", nil
 		}
@@ -1372,7 +1652,7 @@ func runTUI(client *PodmanClient) error {
 				app.MenuIndex = max(0, app.MenuIndex-1)
 			case "down":
 				app.MenuIndex = min(len(app.menuEntries())-1, app.MenuIndex+1)
-			case "enter", "space":
+			case "enter", "space", "y":
 				entries := app.menuEntries()
 				if len(entries) == 0 {
 					continue
@@ -1451,20 +1731,25 @@ func runTUI(client *PodmanClient) error {
 			if !app.FocusMain {
 				app.moveFocus(1)
 			}
+		case "backtab":
+			if !app.FocusMain {
+				app.moveFocus(-1)
+			}
 		case "enter":
 			if !app.FocusMain {
 				app.FocusMain = true
+				app.DetailScroll = 0
 				app.loadDetail()
 			}
 		case "esc":
 			app.FocusMain = false
 		case "pageup":
 			if app.FocusMain {
-				app.scroll(-10)
+				app.pageScroll(-1)
 			}
 		case "pagedown":
 			if app.FocusMain {
-				app.scroll(10)
+				app.pageScroll(1)
 			}
 		case "home":
 			if app.FocusMain {
@@ -1472,7 +1757,11 @@ func runTUI(client *PodmanClient) error {
 			}
 		case "end":
 			if app.FocusMain {
-				app.DetailScroll = max(0, len(app.DetailLines)-10)
+				viewRows := app.DetailViewRows
+				if viewRows < 1 {
+					viewRows = 1
+				}
+				app.DetailScroll = max(0, len(app.DetailLines)-viewRows)
 			}
 		case "prevtab":
 			app.cycleTab(-1)
@@ -1513,6 +1802,14 @@ func runTUI(client *PodmanClient) error {
 			}
 		case "start", "stop", "restart", "pause", "kill", "remove":
 			if !app.FocusMain {
+				if key == "pause" {
+					if item := app.current(); item != nil && strings.EqualFold(item.State, "paused") {
+						app.perform("unpause")
+					} else {
+						app.perform("pause")
+					}
+					continue
+				}
 				if key == "stop" || key == "kill" || key == "remove" {
 					if app.confirm(term, key) {
 						app.perform(key)
@@ -1537,10 +1834,22 @@ func (a *App) loadDetail() {
 	}
 }
 func (a *App) scroll(delta int) {
-	maximum := max(0, len(a.DetailLines)-10)
+	viewRows := a.DetailViewRows
+	if viewRows < 1 {
+		viewRows = 1
+	}
+	maximum := max(0, len(a.DetailLines)-viewRows)
 	current := a.DetailScroll
 	current = max(0, min(maximum, current+delta))
 	a.setDetailScroll(current)
+}
+
+func (a *App) pageScroll(direction int) {
+	viewRows := a.DetailViewRows
+	if viewRows < 2 {
+		viewRows = 2
+	}
+	a.scroll(direction * (viewRows - 1))
 }
 func (a *App) setDetailScroll(value int) { a.DetailScroll = value }
 

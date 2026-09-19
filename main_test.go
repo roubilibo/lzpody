@@ -107,3 +107,43 @@ func TestGoProjectFilesExist(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOmarchyThemePaletteIsLoaded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("OMARCHY_PATH", filepath.Join(home, "omarchy"))
+	if err := os.MkdirAll(filepath.Join(home, ".local/state/omarchy/current"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "omarchy/themes/demo-theme"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".local/state/omarchy/current/theme.name"), []byte("demo-theme\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	colors := "accent = \"#010203\"\nforeground = \"#040506\"\nselection = \"#070809\"\nmuted = \"#0a0b0c\"\ngreen = \"#0d0e0f\"\nred = \"#101112\"\nyellow = \"#131415\"\n"
+	if err := os.WriteFile(filepath.Join(home, "omarchy/themes/demo-theme/colors.toml"), []byte(colors), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	theme := loadUITheme()
+	if theme.Name != "Demo Theme" {
+		t.Fatalf("theme name = %q", theme.Name)
+	}
+	if !strings.Contains(theme.Title, "38;2;1;2;3") || !strings.Contains(theme.Normal, "38;2;4;5;6") {
+		t.Fatalf("theme colors were not applied: title=%q normal=%q", theme.Title, theme.Normal)
+	}
+}
+
+func TestDetailPaginationUsesVisibleRows(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.DetailLines = make([]string, 20)
+	app.DetailViewRows = 5
+	app.scroll(100)
+	if app.DetailScroll != 15 {
+		t.Fatalf("scroll = %d, want 15", app.DetailScroll)
+	}
+	app.pageScroll(-1)
+	if app.DetailScroll != 11 {
+		t.Fatalf("page scroll = %d, want 11", app.DetailScroll)
+	}
+}

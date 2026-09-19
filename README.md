@@ -20,7 +20,7 @@ It does not invoke Docker CLI or require a Docker compatibility layer.
 - Interactive container shell through the native `podman exec` command.
 - Name/state/image filter.
 - Lazydocker-style stacked resource panels, focused detail view, scrolling, and action menu.
-- Python 3.11+ with no third-party runtime dependencies.
+- A single Go binary with no runtime dependencies beyond Podman and a Unix socket.
 
 ## Run
 
@@ -31,18 +31,22 @@ systemctl --user enable --now podman.socket
 ./lzpody
 ```
 
+From a source checkout, `./lzpody` uses `go run`; a release install executes
+the downloaded binary directly.
+
 Install to `~/.local/bin` with curl:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/roubilibo/lzpody/main/install.sh | bash
 ```
 
-The installer is dependency-light: it downloads the TUI and wrapper, then
-places them in `~/.local/bin`. Override the destination with `PREFIX` or
+The installer is dependency-light: it downloads the platform binary and
+places it in `~/.local/bin`. Override the destination with `PREFIX` or
 `BIN_DIR`, and pin a release with `LZPODY_VERSION`.
 
-For a fork or another hosting location, override the source base URL with
-`LZPODY_BASE_URL`.
+For a fork or another release host, override the binary URL with
+`LZPODY_BINARY_URL` or its release directory with `LZPODY_RELEASE_BASE_URL`.
+The installer supports Linux `amd64`, `arm64`, and `armv7` builds.
 
 If the socket was enabled before but its file is missing, recover it with:
 
@@ -91,14 +95,24 @@ and navigation model.
 
 ## Omarchy appearance
 
-The TUI reads the active Omarchy palette from
-`~/.config/omarchy/themes/<active-theme>/colors.toml`. It uses the theme's
-foreground, accent, selection, muted, green, red, and yellow colors, so a
-theme change is reflected the next time the TUI starts.
+The TUI reads the active Omarchy theme name from
+`~/.local/state/omarchy/current/theme.name` and displays it in the header. The
+terminal's existing color profile is preserved, so it remains usable outside
+Omarchy as well.
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v
-python3 -m py_compile lzpody.py
+go test ./...
+go build -o lzpody-bin .
+./lzpody-bin --help
 ```
+
+Build release assets with names such as `lzpody-linux-amd64`:
+
+```bash
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o lzpody-linux-amd64 .
+```
+
+Pushing a `v*` tag runs the release workflow and publishes the three Linux
+assets consumed by `install.sh`.

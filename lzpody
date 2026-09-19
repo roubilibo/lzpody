@@ -1,4 +1,24 @@
 #!/bin/sh
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$script_dir/lzpody.py" "$@"
+
+if [ -n "${LZPODY_BIN:-}" ]; then
+	if [ ! -x "$LZPODY_BIN" ]; then
+		echo "lzpody: LZPODY_BIN is not executable: $LZPODY_BIN" >&2
+		exit 1
+	fi
+	exec "$LZPODY_BIN" "$@"
+fi
+
+for candidate in "$script_dir/lzpody-bin" "$script_dir/bin/lzpody"; do
+	if [ -x "$candidate" ]; then
+		exec "$candidate" "$@"
+	fi
+done
+
+if command -v go >/dev/null 2>&1 && [ -f "$script_dir/go.mod" ]; then
+	exec go run "$script_dir" "$@"
+fi
+
+echo "lzpody: Go binary not found. Install a release with install.sh or set LZPODY_BIN." >&2
+exit 1

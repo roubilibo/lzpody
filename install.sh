@@ -4,33 +4,44 @@ set -eu
 
 PREFIX=${PREFIX:-"$HOME/.local"}
 BIN_DIR=${BIN_DIR:-"$PREFIX/bin"}
-VERSION=${LZPODY_VERSION:-${PODMAN_TUI_VERSION:-main}}
-BASE_URL=${LZPODY_BASE_URL:-${PODMAN_TUI_BASE_URL:-"https://raw.githubusercontent.com/roubilibo/lzpody/$VERSION"}}
-BASE_URL=${BASE_URL%/}
+VERSION=${LZPODY_VERSION:-${PODMAN_TUI_VERSION:-latest}}
+
+case "$(uname -s)" in
+  Linux) OS=linux ;;
+  *) echo "lzpody installer: only Linux is currently supported" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  armv7l|armv7) ARCH=armv7 ;;
+  *) echo "lzpody installer: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+RELEASE_BASE_URL=${LZPODY_RELEASE_BASE_URL:-"https://github.com/roubilibo/lzpody/releases/download/$VERSION"}
+RELEASE_BASE_URL=${RELEASE_BASE_URL%/}
+if [ -n "${LZPODY_BINARY_URL:-}" ]; then
+  BINARY_URL=$LZPODY_BINARY_URL
+elif [ -n "${LZPODY_BASE_URL:-${PODMAN_TUI_BASE_URL:-}}" ]; then
+  BASE_URL=${LZPODY_BASE_URL:-${PODMAN_TUI_BASE_URL:-}}
+  BINARY_URL="${BASE_URL%/}/lzpody-$OS-$ARCH"
+else
+  BINARY_URL="$RELEASE_BASE_URL/lzpody-$OS-$ARCH"
+fi
 
 command -v curl >/dev/null 2>&1 || {
   echo "lzpody installer: curl is required" >&2
   exit 1
 }
-command -v python3 >/dev/null 2>&1 || {
-  echo "lzpody installer: python3 is required" >&2
-  exit 1
-}
-python3 - <<'PY'
-import sys
-if sys.version_info < (3, 11):
-    print("lzpody installer: Python 3.11 or newer is required", file=sys.stderr)
-    raise SystemExit(1)
-PY
-
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/lzpody.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
-curl --fail --silent --show-error --location "$BASE_URL/lzpody.py" -o "$tmp_dir/lzpody.py"
-curl --fail --silent --show-error --location "$BASE_URL/lzpody" -o "$tmp_dir/lzpody"
+if ! curl --fail --silent --show-error --location "$BINARY_URL" -o "$tmp_dir/lzpody"; then
+  echo "lzpody installer: could not download $BINARY_URL" >&2
+  echo "Set LZPODY_BINARY_URL to a matching Go build, or publish a release asset." >&2
+  exit 1
+fi
 
 mkdir -p "$BIN_DIR"
-install -m 0755 "$tmp_dir/lzpody.py" "$BIN_DIR/lzpody.py"
 install -m 0755 "$tmp_dir/lzpody" "$BIN_DIR/lzpody"
 
 echo "Installed lzpody to $BIN_DIR/lzpody"

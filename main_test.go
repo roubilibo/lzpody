@@ -233,3 +233,32 @@ func TestBubbleTeaViewIncludesNativeLayoutAndConfirmation(t *testing.T) {
 		}
 	}
 }
+
+func TestPanelStyleDoesNotBleedIntoDetailText(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.Mode = "images"
+	app.Items["images"] = []Item{{Kind: "image", ID: "img1", Name: "mysql:8.4", State: "image", Status: "1.0 MiB"}}
+	app.DetailMode = "config"
+	app.DetailLines = []string{"line 0", "line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7", "line 8", "detail-body"}
+
+	view := (bubbleModel{app: app, width: 100, height: 30}).View()
+	lines := strings.Split(view, "\n")
+	if len(lines) <= 13 {
+		t.Fatalf("rendered view has %d lines, want detail row", len(lines))
+	}
+	line := lines[13]
+	body := "detail-body"
+	bodyStart := strings.Index(line, body)
+	if bodyStart < 0 {
+		t.Fatalf("detail body is missing from row: %q", line)
+	}
+	styleStart := strings.LastIndex(line[:bodyStart], "\x1b[")
+	if styleStart < 0 {
+		t.Fatalf("detail body has no preceding ANSI style: %q", line)
+	}
+	style := line[styleStart:bodyStart]
+	theme := loadUITheme()
+	if !strings.HasPrefix(style, theme.Normal) {
+		t.Fatalf("detail body inherited style %q, want normal style %q", style, theme.Normal)
+	}
+}

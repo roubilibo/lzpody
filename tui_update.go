@@ -1,49 +1,13 @@
 package main
 
 import (
-	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-type bubbleRefreshMsg struct{}
-
-type bubbleActionMsg struct {
-	action string
-}
-
-type bubbleExternalMsg struct {
-	itemID string
-	action string
-	err    error
-}
-
-type bubbleModel struct {
-	app          *App
-	width        int
-	height       int
-	refreshAfter time.Duration
-}
-
-func newBubbleModel(app *App) bubbleModel {
-	width, height := terminalSize()
-	return bubbleModel{app: app, width: width, height: height, refreshAfter: refreshInterval}
-}
-
-func (m bubbleModel) Init() tea.Cmd {
-	return m.refreshCmd()
-}
-
-func (m bubbleModel) refreshCmd() tea.Cmd {
-	return tea.Tick(m.refreshAfter, func(time.Time) tea.Msg {
-		return bubbleRefreshMsg{}
-	})
-}
-
-func (m bubbleModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -79,16 +43,7 @@ func (m bubbleModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 }
-
-func (m bubbleModel) View() string {
-	width, height := m.width, m.height
-	if width <= 0 || height <= 0 {
-		width, height = terminalSize()
-	}
-	return strings.ReplaceAll(m.app.frame(width, height), "\r\n", "\n")
-}
-
-func (m bubbleModel) refresh() {
+func (m Model) refresh() {
 	keepID := ""
 	if item := m.app.current(); item != nil {
 		keepID = item.ID
@@ -96,7 +51,7 @@ func (m bubbleModel) refresh() {
 	m.app.refresh(keepID)
 }
 
-func (m bubbleModel) updateMain(message tea.KeyMsg) tea.Cmd {
+func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 	key := message.String()
 	switch key {
 	case "q", "ctrl+c":
@@ -223,7 +178,7 @@ func (m bubbleModel) updateMain(message tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m bubbleModel) updateMenu(message tea.KeyMsg) tea.Cmd {
+func (m Model) updateMenu(message tea.KeyMsg) tea.Cmd {
 	switch message.String() {
 	case "q", "esc":
 		m.app.closeMenu()
@@ -237,7 +192,7 @@ func (m bubbleModel) updateMenu(message tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m bubbleModel) executeMenuAction() tea.Cmd {
+func (m Model) executeMenuAction() tea.Cmd {
 	action := m.app.selectedMenuAction()
 	m.app.closeMenu()
 	switch action {
@@ -272,7 +227,7 @@ func (m bubbleModel) executeMenuAction() tea.Cmd {
 	return nil
 }
 
-func (m bubbleModel) requestAction(action string) tea.Cmd {
+func (m Model) requestAction(action string) tea.Cmd {
 	if m.app.current() == nil {
 		return nil
 	}
@@ -280,7 +235,7 @@ func (m bubbleModel) requestAction(action string) tea.Cmd {
 	return nil
 }
 
-func (m bubbleModel) updateConfirmation(message tea.KeyMsg) tea.Cmd {
+func (m Model) updateConfirmation(message tea.KeyMsg) tea.Cmd {
 	switch message.String() {
 	case "y", "Y", "enter":
 		action := m.app.ConfirmAction
@@ -297,7 +252,7 @@ func (m bubbleModel) updateConfirmation(message tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m bubbleModel) updateFilter(message tea.KeyMsg) tea.Cmd {
+func (m Model) updateFilter(message tea.KeyMsg) tea.Cmd {
 	switch message.String() {
 	case "enter":
 		m.app.Filter = strings.TrimSpace(m.app.FilterDraft)
@@ -317,35 +272,4 @@ func (m bubbleModel) updateFilter(message tea.KeyMsg) tea.Cmd {
 		}
 	}
 	return nil
-}
-
-func (m bubbleModel) external(action string) tea.Cmd {
-	item := m.app.current()
-	if item == nil {
-		return nil
-	}
-	var command *exec.Cmd
-	if action == "shell" {
-		command = exec.Command("podman", "exec", "-it", item.Name, "sh")
-	} else {
-		command = exec.Command("podman", "attach", item.Name)
-	}
-	itemID := item.ID
-	return tea.ExecProcess(command, func(err error) tea.Msg {
-		if _, exited := err.(*exec.ExitError); exited {
-			err = nil
-		}
-		return bubbleExternalMsg{itemID: itemID, action: action, err: err}
-	})
-}
-
-func runBubbleTUI(client *PodmanClient) error {
-	if !isTTY() {
-		return fmt.Errorf("lzpody requires an interactive terminal")
-	}
-	app := NewApp(client)
-	app.refresh("")
-	model := newBubbleModel(app)
-	_, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
-	return err
 }

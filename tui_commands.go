@@ -1,0 +1,38 @@
+package main
+
+import (
+	"fmt"
+	"os/exec"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func (m Model) external(action string) tea.Cmd {
+	item := m.app.current()
+	if item == nil {
+		return nil
+	}
+	var command *exec.Cmd
+	if action == "shell" {
+		command = exec.Command("podman", "exec", "-it", item.Name, "sh")
+	} else {
+		command = exec.Command("podman", "attach", item.Name)
+	}
+	itemID := item.ID
+	return tea.ExecProcess(command, func(err error) tea.Msg {
+		if _, exited := err.(*exec.ExitError); exited {
+			err = nil
+		}
+		return bubbleExternalMsg{itemID: itemID, action: action, err: err}
+	})
+}
+func runBubbleTUI(client *PodmanClient) error {
+	if !isTTY() {
+		return fmt.Errorf("lzpody requires an interactive terminal")
+	}
+	app := NewApp(client)
+	app.refresh("")
+	model := newBubbleModel(app)
+	_, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
+	return err
+}

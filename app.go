@@ -41,6 +41,22 @@ type App struct {
 	FilterDraft    string
 }
 
+type resourceSnapshot struct {
+	items       map[string][]Item
+	status      string
+	lastRefresh time.Time
+}
+
+type detailResult struct {
+	itemID       string
+	mode         string
+	lines        []string
+	health       string
+	status       string
+	statsHistory []map[string]any
+	err          error
+}
+
 func NewApp(client *PodmanClient) *App {
 	items, selected := map[string][]Item{}, map[string]int{}
 	for _, mode := range resourceModes {
@@ -59,10 +75,11 @@ func (a *App) current() *Item {
 	return &items[index]
 }
 
-func (a *App) refresh(keepID string) {
-	loaders := map[string]func() ([]map[string]any, error){"containers": a.Client.containers, "pods": a.Client.pods, "images": a.Client.images, "volumes": a.Client.volumes, "networks": a.Client.networks}
+func fetchResourceSnapshot(client *PodmanClient, filter string, hideStopped bool) resourceSnapshot {
+	loaders := map[string]func() ([]map[string]any, error){"containers": client.containers, "pods": client.pods, "images": client.images, "volumes": client.volumes, "networks": client.networks}
 	converters := map[string]func(map[string]any) Item{"containers": containerItem, "pods": podItem, "images": imageItem, "volumes": volumeItem, "networks": networkItem}
-	needle := strings.ToLower(a.Filter)
+	items := map[string][]Item{}
+	needle := strings.ToLower(filter)
 	var firstError error
 	for _, mode := range resourceModes {
 		raw, err := loaders[mode]()
@@ -70,15 +87,14 @@ func (a *App) refresh(keepID string) {
 			if firstError == nil {
 				firstError = err
 			}
-			a.Items[mode] = nil
-			a.Selected[mode] = 0
+			items[mode] = nil
 			continue
 		}
 		converted := make([]Item, 0, len(raw))
 		for _, object := range raw {
 			item := converters[mode](object)
 			if mode == "containers" {
-				if sample, statsErr := a.Client.stats(item.ID); statsErr == nil {
+				if sample, statsErr := client.stats(item.ID); statsErr == nil {
 					if payload := statsPayload(sample); payload != nil {
 						item.CPU = numberValue(payload["CPU"])
 						if item.CPU == 0 {
@@ -87,7 +103,7 @@ func (a *App) refresh(keepID string) {
 					}
 				}
 			}
-			if a.HideStopped && mode == "containers" && !isRunning(item.State) {
+			if hideStopped && mode == "containers" && !isRunning(item.State) {
 				continue
 			}
 			if needle != "" && !strings.Contains(strings.ToLower(item.Name+" "+item.Image+" "+item.State), needle) {
@@ -95,6 +111,19 @@ func (a *App) refresh(keepID string) {
 			}
 			converted = append(converted, item)
 		}
+		items[mode] = converted
+	}
+	now := time.Now()
+	status := "Updated " + now.Format("15:04:05")
+	if firstError != nil {
+		status = firstError.Error()
+	}
+	return resourceSnapshot{items: items, status: status, lastRefresh: now}
+}
+
+func (a *App) applyRefresh(result resourceSnapshot, keepID string) {
+	for _, mode := range resourceModes {
+		converted := result.items[mode]
 		a.Items[mode] = converted
 		if mode == a.Mode && keepID != "" {
 			a.Selected[mode] = 0
@@ -108,215 +137,174 @@ func (a *App) refresh(keepID string) {
 			a.Selected[mode] = max(0, len(converted)-1)
 		}
 	}
-	a.LastRefresh = time.Now()
+	a.LastRefresh = result.lastRefresh
+	a.Status = result.status
 	a.Dirty = true
-	if firstError != nil {
-		a.Status = firstError.Error()
-	} else {
-		a.Status = "Updated " + a.LastRefresh.Format("15:04:05")
-	}
-	if a.current() == nil {
-		a.DetailLines = []string{"No item selected."}
-		a.DetailMode = "summary"
-	} else {
-		switch a.DetailMode {
-		case "summary":
-			a.loadSummary()
-		case "logs":
-			a.loadLogs(true)
-		case "stats":
-			a.loadStats(true)
-		case "top":
-			a.loadTop(true)
+}
+
+func fetchDetail(client *PodmanClient, item Item, mode string, history []map[string]any) detailResult {
+	result := detailResult{itemID: item.ID, mode: mode}
+	switch mode {
+	case "summary":
+		result.lines = []string{fmt.Sprintf("Name:    %s", item.Name), fmt.Sprintf("ID:      %s", item.ID), fmt.Sprintf("State:   %s", item.State), fmt.Sprintf("Status:  %s", item.Status)}
+		if item.Kind == "container" {
+			health := item.Health
+			if inspected, err := client.inspect("containers", item.ID); err == nil {
+				if object, ok := inspected.(map[string]any); ok {
+					health = healthStatus(object, "no healthcheck")
+				}
+			}
+			result.health = health
+			result.lines = append(result.lines, fmt.Sprintf("Health:  %s", defaultText(health, "unknown")), fmt.Sprintf("CPU:     %.2f%%", item.CPU), "Ports / forwarding:")
+			if len(item.Ports) == 0 {
+				result.lines = append(result.lines, "  (none)")
+			} else {
+				for _, port := range item.Ports {
+					result.lines = append(result.lines, "  "+port)
+				}
+			}
 		}
+		if item.Image != "" {
+			result.lines = append(result.lines, "Image:   "+item.Image)
+		}
+		result.lines = append(result.lines, "", "Press x or ? to open available actions.")
+	case "logs":
+		if item.Kind != "container" {
+			return result
+		}
+		value, err := client.logs(item.ID)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		result.lines = splitLines(value, "(no logs)")
+		result.status = "Logs: " + item.Name
+	case "stats":
+		if item.Kind != "container" && item.Kind != "pod" {
+			return result
+		}
+		var value any
+		var err error
+		if item.Kind == "container" {
+			value, err = client.stats(item.ID)
+		} else {
+			value, err = client.podStats(item.ID)
+		}
+		if err != nil {
+			result.err = err
+			return result
+		}
+		if sample := statsPayload(value); sample != nil {
+			history = append(history, sample)
+			if len(history) > 60 {
+				history = history[len(history)-60:]
+			}
+			result.statsHistory = history
+			result.lines = statsLines(history)
+		} else {
+			result.lines = []string{"No statistics available."}
+		}
+		result.status = "Stats: " + item.Name
+	case "env":
+		if item.Kind != "container" {
+			return result
+		}
+		value, err := client.inspect("containers", item.ID)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		if object, ok := value.(map[string]any); ok {
+			if config, ok := object["Config"].(map[string]any); ok {
+				if env, ok := config["Env"].([]any); ok {
+					for _, entry := range env {
+						result.lines = append(result.lines, scalarText(entry))
+					}
+				}
+			}
+		}
+		if len(result.lines) == 0 {
+			result.lines = []string{"(no environment variables)"}
+		}
+		result.status = "Environment: " + item.Name
+	case "config":
+		value, err := inspectItem(client, item)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		encoded, _ := json.MarshalIndent(value, "", "  ")
+		result.lines = strings.Split(string(encoded), "\n")
+		result.status = strings.Title(mode) + ": " + item.Name
+	case "top":
+		if item.Kind != "container" {
+			return result
+		}
+		value, err := client.top(item.ID)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		if object, ok := value.(map[string]any); ok {
+			titles, _ := object["Titles"].([]any)
+			processes, _ := object["Processes"].([]any)
+			if len(titles) > 0 {
+				values := []string{}
+				for _, title := range titles {
+					values = append(values, scalarText(title))
+				}
+				result.lines = append(result.lines, strings.Join(values, "  "))
+			}
+			for _, process := range processes {
+				if row, ok := process.([]any); ok {
+					values := []string{}
+					for _, cell := range row {
+						values = append(values, scalarText(cell))
+					}
+					result.lines = append(result.lines, strings.Join(values, "  "))
+				}
+			}
+		} else {
+			encoded, _ := json.MarshalIndent(value, "", "  ")
+			result.lines = strings.Split(string(encoded), "\n")
+		}
+		if len(result.lines) == 0 {
+			result.lines = []string{"(no processes)"}
+		}
+		result.status = "Top: " + item.Name
+	}
+	return result
+}
+
+func inspectItem(client *PodmanClient, item Item) (any, error) {
+	return client.inspect(item.Kind+"s", item.ID)
+}
+
+func (a *App) applyDetail(result detailResult) {
+	item := a.current()
+	if item == nil || item.ID != result.itemID || a.DetailMode != result.mode {
+		return
+	}
+	if result.err != nil {
+		a.Status = result.err.Error()
+		return
+	}
+	if result.health != "" {
+		item.Health = result.health
+	}
+	if result.statsHistory != nil {
+		a.StatsHistory[result.itemID] = result.statsHistory
+	}
+	a.DetailLines = result.lines
+	a.DetailMode = result.mode
+	a.DetailScroll = 0
+	if result.status != "" {
+		a.Status = result.status
 	}
 }
 
 func isRunning(state string) bool {
 	return strings.ToLower(state) == "running" || strings.ToLower(state) == "paused"
-}
-
-func (a *App) loadSummary() {
-	item := a.current()
-	if item == nil {
-		a.DetailLines = []string{"No item selected."}
-		a.DetailScroll = 0
-		return
-	}
-	a.DetailLines = []string{fmt.Sprintf("Name:    %s", item.Name), fmt.Sprintf("ID:      %s", item.ID), fmt.Sprintf("State:   %s", item.State), fmt.Sprintf("Status:  %s", item.Status)}
-	if item.Kind == "container" {
-		health := item.Health
-		if inspected, err := a.Client.inspect("containers", item.ID); err == nil {
-			if object, ok := inspected.(map[string]any); ok {
-				health = healthStatus(object, "no healthcheck")
-				item.Health = health
-			}
-		}
-		a.DetailLines = append(a.DetailLines, fmt.Sprintf("Health:  %s", defaultText(health, "unknown")), fmt.Sprintf("CPU:     %.2f%%", item.CPU), "Ports / forwarding:")
-		if len(item.Ports) == 0 {
-			a.DetailLines = append(a.DetailLines, "  (none)")
-		} else {
-			for _, port := range item.Ports {
-				a.DetailLines = append(a.DetailLines, "  "+port)
-			}
-		}
-	}
-	if item.Image != "" {
-		a.DetailLines = append(a.DetailLines, "Image:   "+item.Image)
-	}
-	a.DetailLines = append(a.DetailLines, "", "Press x or ? to open available actions.")
-	a.DetailScroll = 0
-}
-
-func (a *App) loadLogs(silent ...bool) {
-	item := a.current()
-	if item == nil || item.Kind != "container" {
-		return
-	}
-	value, err := a.Client.logs(item.ID)
-	if err != nil {
-		a.Status = err.Error()
-		return
-	}
-	a.DetailLines = splitLines(value, "(no logs)")
-	a.DetailMode = "logs"
-	if len(silent) == 0 || !silent[0] {
-		a.DetailScroll = 0
-		a.Status = "Logs: " + item.Name
-	}
-}
-
-func (a *App) loadStats(silent ...bool) {
-	item := a.current()
-	if item == nil || (item.Kind != "container" && item.Kind != "pod") {
-		return
-	}
-	var value any
-	var err error
-	if item.Kind == "container" {
-		value, err = a.Client.stats(item.ID)
-	} else {
-		value, err = a.Client.podStats(item.ID)
-	}
-	if err != nil {
-		a.Status = err.Error()
-		return
-	}
-	if sample := statsPayload(value); sample != nil {
-		history := append(a.StatsHistory[item.ID], sample)
-		if len(history) > 60 {
-			history = history[len(history)-60:]
-		}
-		a.StatsHistory[item.ID] = history
-		a.DetailLines = statsLines(history)
-	} else {
-		a.DetailLines = []string{"No statistics available."}
-	}
-	a.DetailMode = "stats"
-	if len(silent) == 0 || !silent[0] {
-		a.DetailScroll = 0
-		a.Status = "Stats: " + item.Name
-	}
-}
-
-func (a *App) loadInspect(mode string) {
-	item := a.current()
-	if item == nil {
-		return
-	}
-	value, err := a.Client.inspect(item.Kind+"s", item.ID)
-	if item.Kind == "network" {
-		value, err = a.Client.inspect("networks", item.ID)
-	}
-	if item.Kind == "image" {
-		value, err = a.Client.inspect("images", item.ID)
-	}
-	if item.Kind == "volume" {
-		value, err = a.Client.inspect("volumes", item.ID)
-	}
-	if err != nil {
-		a.Status = err.Error()
-		return
-	}
-	encoded, _ := json.MarshalIndent(value, "", "  ")
-	a.DetailLines = strings.Split(string(encoded), "\n")
-	a.DetailMode = mode
-	a.DetailScroll = 0
-	a.Status = strings.Title(mode) + ": " + item.Name
-}
-
-func (a *App) loadEnv() {
-	item := a.current()
-	if item == nil || item.Kind != "container" {
-		return
-	}
-	value, err := a.Client.inspect("containers", item.ID)
-	if err != nil {
-		a.Status = err.Error()
-		return
-	}
-	lines := []string{}
-	if object, ok := value.(map[string]any); ok {
-		if config, ok := object["Config"].(map[string]any); ok {
-			if env, ok := config["Env"].([]any); ok {
-				for _, entry := range env {
-					lines = append(lines, scalarText(entry))
-				}
-			}
-		}
-	}
-	if len(lines) == 0 {
-		lines = []string{"(no environment variables)"}
-	}
-	a.DetailLines = lines
-	a.DetailMode = "env"
-	a.DetailScroll = 0
-	a.Status = "Environment: " + item.Name
-}
-
-func (a *App) loadTop(silent ...bool) {
-	item := a.current()
-	if item == nil || item.Kind != "container" {
-		return
-	}
-	value, err := a.Client.top(item.ID)
-	if err != nil {
-		a.Status = err.Error()
-		return
-	}
-	lines := []string{}
-	if object, ok := value.(map[string]any); ok {
-		titles, _ := object["Titles"].([]any)
-		processes, _ := object["Processes"].([]any)
-		if len(titles) > 0 {
-			values := []string{}
-			for _, title := range titles {
-				values = append(values, scalarText(title))
-			}
-			lines = append(lines, strings.Join(values, "  "))
-		}
-		for _, process := range processes {
-			if row, ok := process.([]any); ok {
-				values := []string{}
-				for _, cell := range row {
-					values = append(values, scalarText(cell))
-				}
-				lines = append(lines, strings.Join(values, "  "))
-			}
-		}
-	} else {
-		encoded, _ := json.MarshalIndent(value, "", "  ")
-		lines = strings.Split(string(encoded), "\n")
-	}
-	if len(lines) == 0 {
-		lines = []string{"(no processes)"}
-	}
-	a.DetailLines = lines
-	a.DetailMode = "top"
-	if len(silent) == 0 || !silent[0] {
-		a.DetailScroll = 0
-		a.Status = "Top: " + item.Name
-	}
 }
 
 func splitLines(value, fallback string) []string {
@@ -350,21 +338,7 @@ func (a *App) cycleTab(delta int) {
 		}
 	}
 	next := tabs[(index+delta+len(tabs))%len(tabs)]
-	switch next {
-	case "summary":
-		a.DetailMode = "summary"
-		a.loadSummary()
-	case "logs":
-		a.loadLogs()
-	case "stats":
-		a.loadStats()
-	case "env":
-		a.loadEnv()
-	case "config":
-		a.loadInspect("config")
-	case "top":
-		a.loadTop()
-	}
+	a.DetailMode = next
 }
 
 func (a *App) move(delta int) {
@@ -374,7 +348,6 @@ func (a *App) move(delta int) {
 	}
 	a.Selected[a.Mode] = max(0, min(len(items)-1, a.Selected[a.Mode]+delta))
 	a.DetailMode = "summary"
-	a.loadSummary()
 }
 func (a *App) moveFocus(delta int) {
 	index := 0
@@ -385,7 +358,6 @@ func (a *App) moveFocus(delta int) {
 	}
 	a.Mode = resourceModes[(index+delta+len(resourceModes))%len(resourceModes)]
 	a.DetailMode = "summary"
-	a.loadSummary()
 }
 func (a *App) toggleMode(mode string) {
 	if a.Mode == mode {
@@ -395,7 +367,6 @@ func (a *App) toggleMode(mode string) {
 	a.Mode = mode
 	a.FocusMain = false
 	a.DetailMode = "summary"
-	a.loadSummary()
 }
 
 func (a *App) menuEntries() [][2]string {
@@ -441,44 +412,8 @@ func (a *App) selectedMenuAction() string {
 	return entries[a.MenuIndex][1]
 }
 
-func (a *App) perform(action string) {
-	item := a.current()
-	if item == nil {
-		a.Status = "No item selected."
-		return
-	}
-	id := item.ID
-	name := item.Name
-	var err error
-	switch {
-	case item.Kind == "container":
-		err = a.Client.resourceAction("containers", id, action)
-	case item.Kind == "pod":
-		err = a.Client.resourceAction("pods", id, action)
-	case action == "remove":
-		err = a.Client.remove(item.Kind+"s", id)
-	default:
-		a.Status = fmt.Sprintf("Action %q is not available for %s.", action, item.Kind)
-		return
-	}
-	if err != nil {
-		a.Status = err.Error()
-		return
-	}
-	a.refresh(id)
-	if strings.HasPrefix(a.Status, "Updated ") {
-		a.Status = strings.Title(action) + " " + name + ": OK"
-	}
-}
-
 func (a *App) toggleHideStopped() {
-	current := a.current()
-	keep := ""
-	if current != nil {
-		keep = current.ID
-	}
 	a.HideStopped = !a.HideStopped
-	a.refresh(keep)
 	if a.HideStopped {
 		a.Status = "Stopped containers hidden."
 	} else {
@@ -500,13 +435,6 @@ func min(a, b int) int {
 	return b
 }
 
-func (a *App) loadDetail() {
-	if a.Mode == "containers" {
-		a.loadLogs()
-	} else {
-		a.loadInspect("config")
-	}
-}
 func (a *App) scroll(delta int) {
 	viewRows := a.DetailViewRows
 	if viewRows < 1 {

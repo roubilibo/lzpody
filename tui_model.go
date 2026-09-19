@@ -6,10 +6,20 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-type bubbleRefreshMsg struct{}
+type bubbleRefreshMsg struct {
+	result         resourceSnapshot
+	statusOverride string
+}
+
+type bubbleDetailMsg struct {
+	result detailResult
+}
 
 type bubbleActionMsg struct {
 	action string
+	itemID string
+	name   string
+	err    error
 }
 
 type bubbleExternalMsg struct {
@@ -31,18 +41,47 @@ type Model struct {
 var _ tea.Model = Model{}
 
 func newBubbleModel(app *App) Model {
-	width, height := terminalSize()
-	return Model{app: app, width: width, height: height, refreshAfter: refreshInterval}
+	return Model{app: app, refreshAfter: refreshInterval}
 }
 
 func (m Model) Init() tea.Cmd {
-	return m.refreshCmd()
+	return tea.Batch(m.immediateRefreshCmd(), m.refreshCmd())
 }
 
 func (m Model) refreshCmd() tea.Cmd {
+	client := m.app.Client
+	filter := m.app.Filter
+	hideStopped := m.app.HideStopped
 	return tea.Tick(m.refreshAfter, func(time.Time) tea.Msg {
-		return bubbleRefreshMsg{}
+		return bubbleRefreshMsg{result: fetchResourceSnapshot(client, filter, hideStopped)}
 	})
+}
+
+func (m Model) immediateRefreshCmd() tea.Cmd {
+	return m.immediateRefreshCmdWithStatus("")
+}
+
+func (m Model) immediateRefreshCmdWithStatus(status string) tea.Cmd {
+	client := m.app.Client
+	filter := m.app.Filter
+	hideStopped := m.app.HideStopped
+	return func() tea.Msg {
+		return bubbleRefreshMsg{result: fetchResourceSnapshot(client, filter, hideStopped), statusOverride: status}
+	}
+}
+
+func (m Model) detailCmd() tea.Cmd {
+	item := m.app.current()
+	if item == nil {
+		return nil
+	}
+	client := m.app.Client
+	itemCopy := *item
+	mode := m.app.DetailMode
+	history := append([]map[string]any(nil), m.app.StatsHistory[item.ID]...)
+	return func() tea.Msg {
+		return bubbleDetailMsg{result: fetchDetail(client, itemCopy, mode, history)}
+	}
 }
 
 // bubbleModel is kept as an internal compatibility alias for existing tests.

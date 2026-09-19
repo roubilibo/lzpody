@@ -2,26 +2,24 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
-	"syscall"
-	"unsafe"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 type textRegion struct {
 	start, end int
-	style      string
+	style      lipgloss.Style
 }
 
-func addRegion(regions [][]textRegion, row, start, end int, style string) {
-	if row < 0 || row >= len(regions) || start >= end || style == "" {
+func addRegion(regions [][]textRegion, row, start, end int, style lipgloss.Style) {
+	if row < 0 || row >= len(regions) || start >= end {
 		return
 	}
 	regions[row] = append(regions[row], textRegion{start: start, end: end, style: style})
 }
 
-func addTextRegion(regions [][]textRegion, row, column, width int, text, style string) {
+func addTextRegion(regions [][]textRegion, row, column, width int, text string, style lipgloss.Style) {
 	if width <= 0 {
 		return
 	}
@@ -32,59 +30,33 @@ func addTextRegion(regions [][]textRegion, row, column, width int, text, style s
 	addRegion(regions, row, column, column+len(runes), style)
 }
 
-func styleLine(line, base string, regions []textRegion) string {
+func styleLine(line string, base lipgloss.Style, regions []textRegion) string {
 	runes := []rune(line)
 	if len(runes) == 0 {
-		return base + "\x1b[0m"
+		return base.Render("")
 	}
-	styles := make([]string, len(runes))
-	for index := range styles {
-		styles[index] = base
-	}
-	for _, region := range regions {
+	styleIndexes := make([]int, len(runes))
+	styles := []lipgloss.Style{base}
+	for regionIndex, region := range regions {
+		styles = append(styles, region.style)
 		start := max(0, region.start)
 		end := min(len(runes), region.end)
 		for index := start; index < end; index++ {
-			styles[index] = region.style
+			styleIndexes[index] = regionIndex + 1
 		}
 	}
 	var output strings.Builder
 	start := 0
 	for start < len(runes) {
-		style := styles[start]
+		styleIndex := styleIndexes[start]
 		end := start + 1
-		for end < len(runes) && styles[end] == style {
+		for end < len(runes) && styleIndexes[end] == styleIndex {
 			end++
 		}
-		output.WriteString(style)
-		output.WriteString(string(runes[start:end]))
-		output.WriteString("\x1b[0m")
+		output.WriteString(styles[styleIndex].Render(string(runes[start:end])))
 		start = end
 	}
 	return output.String()
-}
-func isTTY() bool {
-	info, err := os.Stdin.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
-}
-
-func terminalSize() (int, int) {
-	type windowSize struct {
-		rows, columns, horizontal, vertical uint16
-	}
-	var size windowSize
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdout.Fd(), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&size))); errno == 0 && size.columns > 0 && size.rows > 0 {
-		return int(size.columns), int(size.rows)
-	}
-	columns, _ := strconv.Atoi(os.Getenv("COLUMNS"))
-	rows, _ := strconv.Atoi(os.Getenv("LINES"))
-	if columns < 70 {
-		columns = 100
-	}
-	if rows < 22 {
-		rows = 30
-	}
-	return columns, rows
 }
 func clip(text string, width int) string {
 	if width <= 0 {
@@ -134,7 +106,7 @@ func boxLine(width int, left, right rune) string {
 func (a *App) frame(width, height int) string {
 	uiTheme := loadUITheme()
 	lines := make([]string, height)
-	styles := make([]string, height)
+	styles := make([]lipgloss.Style, height)
 	regions := make([][]textRegion, height)
 	for i := range lines {
 		lines[i] = strings.Repeat(" ", width)
@@ -327,7 +299,7 @@ func (a *App) frame(width, height int) string {
 	if a.FilterInput {
 		filterText := "Filter: " + a.FilterDraft
 		putLine(lines, height-2, 1, width-2, filterText)
-		addTextRegion(regions, height-2, 1, width-2, filterText, "\x1b[1m"+uiTheme.Normal)
+		addTextRegion(regions, height-2, 1, width-2, filterText, uiTheme.Normal.Bold(true))
 	}
 	if a.ConfirmAction != "" {
 		drawConfirmOverlay(lines, styles, regions, width, height, uiTheme, a)
@@ -335,7 +307,7 @@ func (a *App) frame(width, height int) string {
 	return frameText(lines, styles, regions)
 }
 
-func drawConfirmOverlay(lines, styles []string, regions [][]textRegion, width, height int, theme UITheme, app *App) {
+func drawConfirmOverlay(lines []string, styles []lipgloss.Style, regions [][]textRegion, width, height int, theme UITheme, app *App) {
 	item := app.current()
 	if item == nil {
 		return
@@ -358,17 +330,17 @@ func drawConfirmOverlay(lines, styles []string, regions [][]textRegion, width, h
 	addTextRegion(regions, top, left+2, boxWidth-4, title, theme.Title)
 	messageLeft := left + max(2, (boxWidth-len([]rune(prompt)))/2)
 	putLine(lines, top+2, messageLeft, boxWidth-(messageLeft-left), prompt)
-	addTextRegion(regions, top+2, messageLeft, boxWidth-(messageLeft-left), prompt, "\x1b[1m"+theme.Selected)
+	addTextRegion(regions, top+2, messageLeft, boxWidth-(messageLeft-left), prompt, theme.Selected.Bold(true))
 	controls := "Y/Enter confirm   N/Esc cancel"
 	controlsLeft := left + max(2, (boxWidth-len([]rune(controls)))/2)
 	putLine(lines, top+4, controlsLeft, boxWidth-(controlsLeft-left), controls)
 	addTextRegion(regions, top+4, controlsLeft, boxWidth-(controlsLeft-left), controls, theme.Key)
 }
 
-func frameText(lines, styles []string, regions [][]textRegion) string {
+func frameText(lines []string, styles []lipgloss.Style, regions [][]textRegion) string {
 	var frame strings.Builder
 	for index, line := range lines {
-		base := ""
+		var base lipgloss.Style
 		if index < len(styles) {
 			base = styles[index]
 		}

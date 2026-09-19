@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os/exec"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -27,11 +26,7 @@ func (m Model) external(action string) tea.Cmd {
 	})
 }
 func runBubbleTUI(client *PodmanClient) error {
-	if !isTTY() {
-		return fmt.Errorf("lzpody requires an interactive terminal")
-	}
 	app := NewApp(client)
-	app.refresh("")
 	model := newBubbleModel(app)
 	_, err := tea.NewProgram(model, tea.WithAltScreen()).Run()
 	return err

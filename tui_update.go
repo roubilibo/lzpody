@@ -2,7 +2,6 @@ package main
 
 import (
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -13,13 +12,30 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case bubbleRefreshMsg:
-		m.refresh()
-		return m, m.refreshCmd()
-	case bubbleActionMsg:
-		m.app.perform(msg.action)
+		keepID := ""
+		if item := m.app.current(); item != nil {
+			keepID = item.ID
+		}
+		m.app.applyRefresh(msg.result, keepID)
+		if msg.statusOverride != "" {
+			m.app.Status = msg.statusOverride
+		}
+		if m.app.current() == nil {
+			m.app.DetailLines = []string{"No item selected."}
+			m.app.DetailMode = "summary"
+		}
+		return m, tea.Batch(m.detailCmd(), m.refreshCmd())
+	case bubbleDetailMsg:
+		m.app.applyDetail(msg.result)
 		return m, nil
+	case bubbleActionMsg:
+		if msg.err != nil {
+			m.app.Status = msg.err.Error()
+			return m, nil
+		}
+		status := strings.Title(msg.action) + " " + msg.name + ": OK"
+		return m, m.immediateRefreshCmdWithStatus(status)
 	case bubbleExternalMsg:
-		m.app.refresh(msg.itemID)
 		if msg.err != nil {
 			if msg.action == "shell" {
 				m.app.Status = "Cannot open shell: " + msg.err.Error()
@@ -27,7 +43,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.app.Status = "Cannot attach to container: " + msg.err.Error()
 			}
 		}
-		return m, nil
+		status := ""
+		if msg.err != nil {
+			status = m.app.Status
+		}
+		return m, m.immediateRefreshCmdWithStatus(status)
 	case tea.KeyMsg:
 		if m.app.FilterInput {
 			return m, m.updateFilter(msg)
@@ -43,14 +63,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 }
-func (m Model) refresh() {
-	keepID := ""
-	if item := m.app.current(); item != nil {
-		keepID = item.ID
-	}
-	m.app.refresh(keepID)
-}
-
 func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 	key := message.String()
 	switch key {
@@ -60,6 +72,7 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 		m.app.openMenu()
 	case "1", "2", "3", "4", "5":
 		m.app.toggleMode(resourceModes[int(key[0]-'1')])
+		return m.detailCmd()
 	case "esc":
 		m.app.FocusMain = false
 	case "up", "k":
@@ -67,34 +80,40 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 			m.app.scroll(-1)
 		} else {
 			m.app.move(-1)
+			return m.detailCmd()
 		}
 	case "down", "j":
 		if m.app.FocusMain {
 			m.app.scroll(1)
 		} else {
 			m.app.move(1)
+			return m.detailCmd()
 		}
 	case "left", "h":
 		if !m.app.FocusMain {
 			m.app.moveFocus(-1)
+			return m.detailCmd()
 		}
 	case "right", "l":
 		if !m.app.FocusMain {
 			m.app.moveFocus(1)
+			return m.detailCmd()
 		}
 	case "tab":
 		if !m.app.FocusMain {
 			m.app.moveFocus(1)
+			return m.detailCmd()
 		}
 	case "shift+tab":
 		if !m.app.FocusMain {
 			m.app.moveFocus(-1)
+			return m.detailCmd()
 		}
 	case "enter":
 		if !m.app.FocusMain {
 			m.app.FocusMain = true
 			m.app.DetailScroll = 0
-			m.app.loadDetail()
+			return m.detailCmd()
 		}
 	case "pgup", "ctrl+u":
 		if m.app.FocusMain {
@@ -114,21 +133,26 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 		}
 	case "[":
 		m.app.cycleTab(-1)
+		return m.detailCmd()
 	case "]":
 		m.app.cycleTab(1)
+		return m.detailCmd()
 	case "i":
-		m.app.loadInspect("config")
+		m.app.DetailMode = "config"
 		m.app.FocusMain = true
+		return m.detailCmd()
 	case "t":
-		m.app.loadStats()
+		m.app.DetailMode = "stats"
 		m.app.FocusMain = true
+		return m.detailCmd()
 	case "m":
 		if !m.app.FocusMain && m.app.Mode == "containers" {
-			m.app.loadLogs()
+			m.app.DetailMode = "logs"
 			m.app.FocusMain = true
+			return m.detailCmd()
 		}
 	case "f5":
-		m.refresh()
+		return m.immediateRefreshCmd()
 	case "/":
 		if !m.app.FocusMain {
 			m.app.FilterInput = true
@@ -137,6 +161,7 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 	case "e":
 		if !m.app.FocusMain && m.app.Mode == "containers" {
 			m.app.toggleHideStopped()
+			return m.immediateRefreshCmd()
 		}
 	case "a":
 		if !m.app.FocusMain && m.app.Mode == "containers" {
@@ -148,7 +173,7 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 		}
 	case "S":
 		if !m.app.FocusMain {
-			m.app.perform("start")
+			return m.actionCmd("start")
 		}
 	case "s":
 		if !m.app.FocusMain {
@@ -156,7 +181,7 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 		}
 	case "r", "R":
 		if !m.app.FocusMain {
-			m.app.perform("restart")
+			return m.actionCmd("restart")
 		}
 	case "p":
 		if !m.app.FocusMain {
@@ -164,7 +189,7 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 			if item := m.app.current(); item != nil && strings.EqualFold(item.State, "paused") {
 				action = "unpause"
 			}
-			m.app.perform(action)
+			return m.actionCmd(action)
 		}
 	case "K":
 		if !m.app.FocusMain {
@@ -197,31 +222,37 @@ func (m Model) executeMenuAction() tea.Cmd {
 	m.app.closeMenu()
 	switch action {
 	case "refresh":
-		m.refresh()
+		return m.immediateRefreshCmd()
 	case "logs":
-		m.app.loadLogs()
+		m.app.DetailMode = "logs"
 		m.app.FocusMain = true
+		return m.detailCmd()
 	case "stats":
-		m.app.loadStats()
+		m.app.DetailMode = "stats"
 		m.app.FocusMain = true
+		return m.detailCmd()
 	case "env":
-		m.app.loadEnv()
+		m.app.DetailMode = "env"
 		m.app.FocusMain = true
+		return m.detailCmd()
 	case "config":
-		m.app.loadInspect("config")
+		m.app.DetailMode = "config"
 		m.app.FocusMain = true
+		return m.detailCmd()
 	case "top":
-		m.app.loadTop()
+		m.app.DetailMode = "top"
 		m.app.FocusMain = true
+		return m.detailCmd()
 	case "shell", "attach":
 		return m.external(action)
 	case "hide_stopped":
 		m.app.toggleHideStopped()
+		return m.immediateRefreshCmd()
 	case "stop", "remove", "kill":
 		return m.requestAction(action)
 	default:
 		if action != "" {
-			m.app.perform(action)
+			return m.actionCmd(action)
 		}
 	}
 	return nil
@@ -235,6 +266,29 @@ func (m Model) requestAction(action string) tea.Cmd {
 	return nil
 }
 
+func (m Model) actionCmd(action string) tea.Cmd {
+	item := m.app.current()
+	if item == nil {
+		return nil
+	}
+	client := m.app.Client
+	itemCopy := *item
+	return func() tea.Msg {
+		var err error
+		switch {
+		case itemCopy.Kind == "container":
+			err = client.resourceAction("containers", itemCopy.ID, action)
+		case itemCopy.Kind == "pod":
+			err = client.resourceAction("pods", itemCopy.ID, action)
+		case action == "remove":
+			err = client.remove(itemCopy.Kind+"s", itemCopy.ID)
+		default:
+			err = &PodmanError{Message: "Action \"" + action + "\" is not available for " + itemCopy.Kind + "."}
+		}
+		return bubbleActionMsg{action: action, itemID: itemCopy.ID, name: itemCopy.Name, err: err}
+	}
+}
+
 func (m Model) updateConfirmation(message tea.KeyMsg) tea.Cmd {
 	switch message.String() {
 	case "y", "Y", "enter":
@@ -242,9 +296,7 @@ func (m Model) updateConfirmation(message tea.KeyMsg) tea.Cmd {
 		m.app.ConfirmAction = ""
 		if item := m.app.current(); item != nil {
 			m.app.Status = strings.Title(action) + " " + item.Name + "..."
-			return tea.Tick(10*time.Millisecond, func(time.Time) tea.Msg {
-				return bubbleActionMsg{action: action}
-			})
+			return m.actionCmd(action)
 		}
 	case "n", "N", "q", "esc", "ctrl+c":
 		m.app.ConfirmAction = ""
@@ -258,7 +310,7 @@ func (m Model) updateFilter(message tea.KeyMsg) tea.Cmd {
 		m.app.Filter = strings.TrimSpace(m.app.FilterDraft)
 		m.app.FilterInput = false
 		m.app.Selected[m.app.Mode] = 0
-		m.refresh()
+		return m.immediateRefreshCmd()
 	case "esc", "ctrl+c":
 		m.app.FilterInput = false
 	case "backspace", "delete":

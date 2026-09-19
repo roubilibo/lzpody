@@ -95,12 +95,34 @@ func TestPodmanClientReportsMissingSocket(t *testing.T) {
 	}
 }
 
-func TestTUIRequiresTTY(t *testing.T) {
-	if isTTY() {
-		t.Skip("test process has a tty")
+func TestBubbleTeaOwnsTerminalLifecycle(t *testing.T) {
+	model := newBubbleModel(NewApp(NewPodmanClient("/tmp/missing.sock")))
+	if model.width != 0 || model.height != 0 {
+		t.Fatalf("model probed terminal size before Bubble Tea: %dx%d", model.width, model.height)
 	}
-	if err := runBubbleTUI(NewPodmanClient("/tmp/missing.sock")); err == nil || !strings.Contains(err.Error(), "interactive terminal") {
-		t.Fatalf("runBubbleTUI error = %v", err)
+	if got := model.View(); got != "Loading terminal…" {
+		t.Fatalf("initial view = %q", got)
+	}
+}
+
+func TestBubbleTeaOwnsPodmanIOThroughCommands(t *testing.T) {
+	app := NewApp(NewPodmanClient(filepath.Join(t.TempDir(), "missing.sock")))
+	model := newBubbleModel(app)
+	command := model.immediateRefreshCmd()
+	if command == nil {
+		t.Fatal("refresh command is nil")
+	}
+	rawMessage := command()
+	message, ok := rawMessage.(bubbleRefreshMsg)
+	if !ok {
+		t.Fatalf("refresh command returned %T, want bubbleRefreshMsg", rawMessage)
+	}
+	if app.Status != "Connecting to rootless Podman..." {
+		t.Fatalf("command mutated model before Update: %q", app.Status)
+	}
+	model.Update(message)
+	if !strings.Contains(app.Status, "Podman socket not found") {
+		t.Fatalf("Update did not apply command result: %q", app.Status)
 	}
 }
 
@@ -131,8 +153,8 @@ func TestOmarchyThemePaletteIsLoaded(t *testing.T) {
 	if theme.Name != "Demo Theme" {
 		t.Fatalf("theme name = %q", theme.Name)
 	}
-	if !strings.Contains(theme.Title, "38;2;1;2;3") || !strings.Contains(theme.Normal, "38;2;4;5;6") {
-		t.Fatalf("theme colors were not applied: title=%q normal=%q", theme.Title, theme.Normal)
+	if theme.Title.GetForeground() == nil || theme.Normal.GetForeground() == nil {
+		t.Fatalf("theme colors were not applied: title=%v normal=%v", theme.Title.GetForeground(), theme.Normal.GetForeground())
 	}
 }
 
@@ -224,7 +246,7 @@ func TestBubbleTeaKeyHandlingPreservesTUIActions(t *testing.T) {
 func TestBubbleTeaViewIncludesNativeLayoutAndConfirmation(t *testing.T) {
 	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
 	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "demo", State: "running"}}
-	app.loadSummary()
+	app.DetailLines = []string{"Name:    demo", "State:   running"}
 	app.ConfirmAction = "stop"
 	view := (bubbleModel{app: app, width: 100, height: 30}).View()
 	for _, want := range []string{"native Libpod", "Confirm action", "Stop demo?", "Y/Enter confirm"} {
@@ -252,13 +274,8 @@ func TestPanelStyleDoesNotBleedIntoDetailText(t *testing.T) {
 	if bodyStart < 0 {
 		t.Fatalf("detail body is missing from row: %q", line)
 	}
-	styleStart := strings.LastIndex(line[:bodyStart], "\x1b[")
-	if styleStart < 0 {
-		t.Fatalf("detail body has no preceding ANSI style: %q", line)
-	}
-	style := line[styleStart:bodyStart]
 	theme := loadUITheme()
-	if !strings.HasPrefix(style, theme.Normal) {
-		t.Fatalf("detail body inherited style %q, want normal style %q", style, theme.Normal)
+	if !strings.Contains(line, theme.Normal.Render(body)) {
+		t.Fatalf("detail body did not use the normal Lip Gloss style: %q", line)
 	}
 }

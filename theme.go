@@ -1,11 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 var defaultThemeColors = map[string]string{
@@ -21,28 +21,23 @@ var defaultThemeColors = map[string]string{
 }
 
 type UITheme struct {
-	Name, Normal, Title, Selected, Muted, Running, Stopped, Error, Border, Key string
+	Name                                             string
+	Normal, Title, Selected, Muted, Running, Stopped lipgloss.Style
+	Error, Border, Key                               lipgloss.Style
 }
 
-func ansiColor(hex string, background bool, bold bool) string {
-	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-	if len(hex) != 6 {
-		return ""
+func colorStyle(foreground, background string, bold bool) lipgloss.Style {
+	style := lipgloss.NewStyle()
+	if foreground != "" {
+		style = style.Foreground(lipgloss.Color(foreground))
 	}
-	red, redErr := strconv.ParseInt(hex[0:2], 16, 32)
-	green, greenErr := strconv.ParseInt(hex[2:4], 16, 32)
-	blue, blueErr := strconv.ParseInt(hex[4:6], 16, 32)
-	if redErr != nil || greenErr != nil || blueErr != nil {
-		return ""
-	}
-	base := 38
-	if background {
-		base = 48
+	if background != "" {
+		style = style.Background(lipgloss.Color(background))
 	}
 	if bold {
-		return fmt.Sprintf("\x1b[1;%d;2;%d;%d;%dm", base, red, green, blue)
+		style = style.Bold(true)
 	}
-	return fmt.Sprintf("\x1b[%d;2;%d;%d;%dm", base, red, green, blue)
+	return style
 }
 
 func loadUITheme() UITheme {
@@ -92,14 +87,14 @@ func loadUITheme() UITheme {
 	}
 	return UITheme{
 		Name:     name,
-		Normal:   ansiColor(colors["foreground"], false, false),
-		Title:    ansiColor(colors["accent"], false, true),
-		Selected: ansiColor(colors["foreground"], false, false) + ansiColor(colors["selection"], true, false),
-		Muted:    ansiColor(colors["muted"], false, false),
-		Running:  ansiColor(colors["green"], false, true),
-		Stopped:  ansiColor(colors["muted"], false, false),
-		Error:    ansiColor(colors["red"], false, true),
-		Border:   ansiColor(colors["muted"], false, false),
-		Key:      ansiColor(colors["yellow"], false, true),
+		Normal:   colorStyle(colors["foreground"], "", false),
+		Title:    colorStyle(colors["accent"], "", true),
+		Selected: colorStyle(colors["foreground"], colors["selection"], false),
+		Muted:    colorStyle(colors["muted"], "", false),
+		Running:  colorStyle(colors["green"], "", true),
+		Stopped:  colorStyle(colors["muted"], "", false),
+		Error:    colorStyle(colors["red"], "", true),
+		Border:   colorStyle(colors["muted"], "", false),
+		Key:      colorStyle(colors["yellow"], "", true),
 	}
 }

@@ -137,6 +137,11 @@ Akane-compatible palette when Omarchy is unavailable.
 
 ## Development
 
+The Go TUI is built around Bubble Tea's model/update/view lifecycle. Terminal
+size and resize events come from Bubble Tea, styling is rendered with Lip Gloss,
+and Podman requests plus external commands run as Bubble Tea commands and return
+messages to `Update`.
+
 ```bash
 go test ./...
 go build -o lzpody-bin .

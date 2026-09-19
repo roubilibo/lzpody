@@ -32,9 +32,10 @@ jobs:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags='-s -w' -o "dist/lzpody-linux-${{ matrix.arch }}" .
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "dist/lzpody-linux-${{ matrix.arch }}" .
       - uses: actions/upload-artifact@v4
         with:
           name: lzpody-${{ matrix.arch }}

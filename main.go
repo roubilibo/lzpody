@@ -6,12 +6,14 @@ import (
 	"os"
 )
 
+var version = "dev"
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version")
 	showHelp := flag.Bool("help", false, "show help")
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("lzpody dev (Go)")
+		fmt.Println("lzpody " + version)
 		return
 	}
 	if *showHelp {

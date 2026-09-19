@@ -722,6 +722,7 @@ type App struct {
 	FocusMain      bool
 	MenuOpen       bool
 	MenuIndex      int
+	Dirty          bool
 }
 
 func NewApp(client *PodmanClient) *App {
@@ -730,7 +731,7 @@ func NewApp(client *PodmanClient) *App {
 		items[mode] = []Item{}
 		selected[mode] = 0
 	}
-	return &App{Client: client, Mode: "containers", Items: items, Selected: selected, DetailMode: "summary", StatsHistory: map[string][]map[string]any{}, Status: "Connecting to rootless Podman..."}
+	return &App{Client: client, Mode: "containers", Items: items, Selected: selected, DetailMode: "summary", StatsHistory: map[string][]map[string]any{}, Status: "Connecting to rootless Podman...", Dirty: true}
 }
 
 func (a *App) current() *Item {
@@ -792,6 +793,7 @@ func (a *App) refresh(keepID string) {
 		}
 	}
 	a.LastRefresh = time.Now()
+	a.Dirty = true
 	if firstError != nil {
 		a.Status = firstError.Error()
 	} else {
@@ -986,6 +988,9 @@ func (a *App) loadTop(silent ...bool) {
 				lines = append(lines, strings.Join(values, "  "))
 			}
 		}
+	} else {
+		encoded, _ := json.MarshalIndent(value, "", "  ")
+		lines = strings.Split(string(encoded), "\n")
 	}
 	if len(lines) == 0 {
 		lines = []string{"(no processes)"}
@@ -1136,6 +1141,7 @@ func (a *App) toggleHideStopped() {
 	} else {
 		a.Status = "Stopped containers shown."
 	}
+	a.Dirty = true
 }
 
 func max(a, b int) int {
@@ -1212,11 +1218,22 @@ func clip(text string, width int) string {
 	if width <= 0 {
 		return ""
 	}
+	text = cleanText(text)
 	runes := []rune(text)
 	if len(runes) > width {
 		return string(runes[:width])
 	}
 	return text + strings.Repeat(" ", width-len(runes))
+}
+
+func cleanText(text string) string {
+	var cleaned strings.Builder
+	for _, character := range text {
+		if character == '\t' || character >= 32 {
+			cleaned.WriteRune(character)
+		}
+	}
+	return cleaned.String()
 }
 func putLine(lines []string, row, column, width int, text string) {
 	if row < 0 || row >= len(lines) || column >= len([]rune(lines[row])) || width <= 0 {
@@ -1455,7 +1472,9 @@ func printFrame(lines, styles []string, regions [][]textRegion) {
 			frame.WriteString("\r\n")
 		}
 	}
-	fmt.Print("\x1b[H\x1b[2J" + frame.String())
+	// Reposition and overwrite the frame without clearing the whole screen on
+	// every timer tick. Full clears make terminals visibly flicker.
+	fmt.Print("\x1b[H" + frame.String() + "\x1b[J")
 }
 
 func themeName() string {
@@ -1640,10 +1659,16 @@ func runTUI(client *PodmanClient) error {
 			}
 			app.refresh(keep)
 		}
-		app.render()
+		if app.Dirty {
+			app.render()
+			app.Dirty = false
+		}
 		key, err := readKey()
 		if err != nil {
 			return nil
+		}
+		if key == "" {
+			continue
 		}
 		if app.MenuOpen {
 			switch key {
@@ -1698,6 +1723,7 @@ func runTUI(client *PodmanClient) error {
 					app.perform(action)
 				}
 			}
+			app.Dirty = true
 			continue
 		}
 		switch key {
@@ -1824,6 +1850,7 @@ func runTUI(client *PodmanClient) error {
 				app.toggleMode(resourceModes[int(key[0]-'1')])
 			}
 		}
+		app.Dirty = true
 	}
 }
 

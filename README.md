@@ -8,6 +8,13 @@ It does not invoke Docker CLI or require a Docker compatibility layer.
 ## preview
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8edb4137-0715-4503-b35b-6286a63a96ad" />
 
+<details>
+<summary>🎬 Click to view showcase</summary>
+
+https://github.com/user-attachments/assets/be54a50e-2339-49b2-852a-880f9aa18df1
+
+</details>
+
 ## Features
 
 - Native rootless Libpod API over the Podman Unix socket.

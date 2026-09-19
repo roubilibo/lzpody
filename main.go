@@ -1173,7 +1173,8 @@ func (t *Terminal) restore() {
 		_, _ = runOutput("stty", t.state)
 		t.state = ""
 	}
-	fmt.Print("\x1b[?25h\x1b[0m\n")
+	// Leave the shell on a clean screen after curses-like rendering ends.
+	fmt.Print("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
 }
 func (t *Terminal) suspend()      { t.restore() }
 func (t *Terminal) resume() error { return t.enter() }

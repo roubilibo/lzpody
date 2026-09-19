@@ -147,3 +147,33 @@ func TestDetailPaginationUsesVisibleRows(t *testing.T) {
 		t.Fatalf("page scroll = %d, want 11", app.DetailScroll)
 	}
 }
+
+func TestNavigationAndContainerMenuParity(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "demo", State: "running"}}
+	app.moveFocus(-1)
+	if app.Mode != "networks" {
+		t.Fatalf("moveFocus(-1) mode = %q", app.Mode)
+	}
+	app.moveFocus(1)
+	if app.Mode != "containers" {
+		t.Fatalf("moveFocus(1) mode = %q", app.Mode)
+	}
+	app.FocusMain = true
+	app.toggleMode("containers")
+	if app.FocusMain {
+		t.Fatal("selecting a panel did not return focus to the side")
+	}
+	entries := app.menuEntries()
+	wanted := map[string]bool{"Start [S]": false, "Stop [s]": false, "Logs [m]": false, "Exec shell [E]": false, "Remove [d]": false}
+	for _, entry := range entries {
+		if _, ok := wanted[entry[0]]; ok {
+			wanted[entry[0]] = true
+		}
+	}
+	for label, present := range wanted {
+		if !present {
+			t.Errorf("menu entry %q missing", label)
+		}
+	}
+}

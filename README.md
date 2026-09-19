@@ -5,23 +5,15 @@ A small native Podman terminal UI inspired by lazydocker.
 The TUI talks to Podman's rootless **Libpod REST API** over the Unix socket.
 It does not invoke Docker CLI or require a Docker compatibility layer.
 
+## preview
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8edb4137-0715-4503-b35b-6286a63a96ad" />
+
 ## Features
 
 - Native rootless Libpod API over the Podman Unix socket.
 - Containers, Pods, Images, Volumes, and Networks views.
-- Container CPU usage in resource rows, health in summaries, and port/forwarding details.
-- Image rows show the image tag and size.
-- Automatic refresh every two seconds.
-- Start, stop, restart, and remove actions.
-- Container logs with automatic refresh.
-- Container and pod resource stats.
-- Container stats with CPU/memory gauges and refresh history sparklines.
-- Native inspect output for every resource type.
-- Interactive container shell through the native `podman exec` command.
-- Name/state/image filter.
-- Lazydocker-style stacked resource panels, focused detail view, scrolling, and action menu.
+- Lazydocker-style stacked resource panels, focused detail view.
 - A single Go binary with no runtime dependencies beyond Podman and a Unix socket.
-- Bubble Tea event loop with resize-aware diff rendering and no full-screen redraw flicker.
 
 ## Run
 
@@ -67,32 +59,73 @@ Override it when needed:
 LZPODY_SOCKET=/path/to/podman.sock ./lzpody
 ```
 
-## Keys
+# lzpody — Keyboard Shortcuts
 
-`↑/↓` or `j/k` select an item, `←/→` or `h/l` switch resource panels, and
-`Tab` moves to the next panel. `1-5` focuses a resource panel. `Enter` moves
-to the main detail view and `Esc` returns to the resource panels. In the main
-view, `↑/↓` or `j/k` scroll, `PgUp/PgDn` scroll by a page, and `Home/End`
-jump to the beginning or end. `Ctrl-U/Ctrl-D` also scroll by a page. `[`/`]`
-switch detail tabs.
+## 1. Navigation
 
-`x` or `?` opens the action menu. Use `↑/↓`, `j/k`, `Enter`, or `Space` to
-choose an action and `Esc` or `q` to close it. Container shortcuts follow
-lazydocker: `e` hides/shows stopped containers, `p` pauses/unpauses, `s`
-stops, `r` restarts, `m` shows logs, `a` attaches, `E` opens a shell, and
-`d` removes. `S` starts a stopped container, `i` opens config, `t` shows
-stats, `K` kills, `/` filters, `F5` refreshes, and `q` quits.
+| Shortcut | Action |
+|---|---|
+| `↑` / `↓` | Select previous / next item |
+| `j` / `k` | Select next / previous item |
+| `←` / `→` | Switch resource panels |
+| `h` / `l` | Switch resource panels |
+| `Tab` | Move to the next panel |
+| `1` – `5` | Focus a specific resource panel |
+| `Enter` | Open the main detail view |
+| `Esc` | Return to resource panels |
 
-Detail actions such as logs, config, environment, top, and stats focus the
-detail panel automatically. Use `↑/↓` or `j/k` for line scrolling,
-`PgUp/PgDn` or `Ctrl-U/Ctrl-D` for page scrolling, and `Home/End` to jump.
+## 2. Detail View
 
-Stopping a container always asks for confirmation. The action menu also shows
-the shortcut hint beside each container action.
+| Shortcut | Action |
+|---|---|
+| `↑` / `↓` | Scroll up / down |
+| `j` / `k` | Scroll down / up |
+| `PgUp` / `PgDn` | Scroll one page up / down |
+| `Ctrl-U` / `Ctrl-D` | Scroll one page up / down |
+| `Home` | Jump to the beginning |
+| `End` | Jump to the end |
+| `[` / `]` | Switch detail tabs |
 
-The resource selector is displayed as five stacked panels on the left, while
-the focused detail panel remains on the right, following lazydocker's layout
-and navigation model.
+## 3. Action Menu
+
+| Shortcut | Action |
+|---|---|
+| `x` / `?` | Open action menu |
+| `↑` / `↓` | Navigate actions |
+| `j` / `k` | Navigate actions |
+| `Enter` / `Space` | Select an action |
+| `Esc` / `q` | Close action menu |
+
+## 4. Container Actions
+
+Container shortcuts follow LazyDocker conventions.
+
+| Shortcut | Action | Description |
+|---|---|---|
+| `e` | Toggle Stopped | Show / hide stopped containers |
+| `p` | Pause / Unpause | Pause or resume a container |
+| `s` | Stop | Stop a running container |
+| `S` | Start | Start a stopped container |
+| `r` | Restart | Restart a container |
+| `m` | Logs | Open container logs |
+| `a` | Attach | Attach to a container |
+| `E` | Shell | Open a shell inside a container |
+| `d` | Remove | Remove a container |
+| `i` | Config | Show container configuration |
+| `t` | Stats | Show container statistics |
+| `K` | Kill | Forcefully terminate a container |
+
+## 5. General Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `/` | Filter items |
+| `F5` | Refresh resources |
+| `q` | Quit application |
+
+---
+
+**Note:** Detail actions such as Logs, Config, Environment, Top, and Stats automatically focus the detail panel. All Detail View navigation shortcuts apply there as well.
 
 ## Omarchy appearance
 

@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -256,9 +257,12 @@ func (c *PodmanClient) request(method, path string, query url.Values, body io.Re
 	if len(raw) == 0 {
 		return nil, nil
 	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	var value any
 	if err := json.Unmarshal(raw, &value); err == nil {
 		return value, nil
+	} else if strings.Contains(contentType, "json") {
+		return nil, &PodmanError{Message: "Podman returned invalid JSON"}
 	}
 	return string(raw), nil
 }
@@ -388,6 +392,12 @@ func firstName(value any) string {
 	if values, ok := value.([]any); ok && len(values) > 0 {
 		return fmt.Sprint(values[0])
 	}
+	if values, ok := value.([]any); ok && len(values) == 0 {
+		return ""
+	}
+	if value == nil {
+		return ""
+	}
 	return valueText(value)
 }
 
@@ -416,11 +426,8 @@ func numberValue(value any) float64 {
 
 func sizeText(value any) string {
 	size := numberValue(value)
-	if size == 0 && value == nil {
-		return ""
-	}
 	for _, unit := range []string{"B", "KiB", "MiB", "GiB", "TiB"} {
-		if size < 1024 || unit == "TiB" {
+		if math.Abs(size) < 1024 || unit == "TiB" {
 			return fmt.Sprintf("%.1f %s", size, unit)
 		}
 		size /= 1024
@@ -434,6 +441,15 @@ func bytesText(value any) string {
 		return "0 B"
 	}
 	return result
+}
+
+func pythonRound(value float64) int {
+	base := math.Floor(value)
+	fraction := value - base
+	if fraction > 0.5 || (fraction == 0.5 && int(base)%2 != 0) {
+		base++
+	}
+	return int(base)
 }
 
 func healthStatus(raw map[string]any, fallback string) string {
@@ -638,7 +654,7 @@ func gauge(value float64, width int) string {
 	if ratio > 1 {
 		ratio = 1
 	}
-	filled := int(ratio*float64(width) + 0.5)
+	filled := pythonRound(ratio * float64(width))
 	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 }
 
@@ -667,7 +683,7 @@ func sparkline(values []float64, width int) string {
 	}
 	var result strings.Builder
 	for _, value := range values {
-		index := int(((value-low)/(high-low))*float64(len(sparkChars)-1) + 0.5)
+		index := pythonRound((value - low) / (high - low) * float64(len(sparkChars)-1))
 		result.WriteRune(sparkChars[index])
 	}
 	return result.String()
@@ -866,8 +882,8 @@ func (a *App) loadLogs(silent ...bool) {
 	a.DetailMode = "logs"
 	if len(silent) == 0 || !silent[0] {
 		a.DetailScroll = 0
+		a.Status = "Logs: " + item.Name
 	}
-	a.Status = "Logs: " + item.Name
 }
 
 func (a *App) loadStats(silent ...bool) {
@@ -899,8 +915,8 @@ func (a *App) loadStats(silent ...bool) {
 	a.DetailMode = "stats"
 	if len(silent) == 0 || !silent[0] {
 		a.DetailScroll = 0
+		a.Status = "Stats: " + item.Name
 	}
-	a.Status = "Stats: " + item.Name
 }
 
 func (a *App) loadInspect(mode string) {
@@ -999,8 +1015,8 @@ func (a *App) loadTop(silent ...bool) {
 	a.DetailMode = "top"
 	if len(silent) == 0 || !silent[0] {
 		a.DetailScroll = 0
+		a.Status = "Top: " + item.Name
 	}
-	a.Status = "Top: " + item.Name
 }
 
 func splitLines(value, fallback string) []string {
@@ -1125,7 +1141,9 @@ func (a *App) perform(action string) {
 		return
 	}
 	a.refresh(id)
-	a.Status = strings.Title(action) + " " + name + ": OK"
+	if strings.HasPrefix(a.Status, "Updated ") {
+		a.Status = strings.Title(action) + " " + name + ": OK"
+	}
 }
 
 func (a *App) toggleHideStopped() {
@@ -1287,12 +1305,15 @@ func (a *App) render() {
 	rightX := leftWidth + 2
 	rightWidth := width - rightX - 1
 	leftHeight := bottom - top + 1
-	panelHeight := leftHeight / len(resourceModes)
+	panelHeight, extraPanels := leftHeight/len(resourceModes), leftHeight%len(resourceModes)
 	for index, mode := range resourceModes {
 		panelTop := top + index*panelHeight
 		panelH := panelHeight
-		if index == len(resourceModes)-1 {
-			panelH = bottom - panelTop + 1
+		if index < extraPanels {
+			panelH++
+			panelTop += index
+		} else {
+			panelTop += extraPanels
 		}
 		panelStyle := uiTheme.Border
 		if mode == a.Mode && !a.FocusMain {
@@ -1405,7 +1426,7 @@ func (a *App) render() {
 	}
 	putLine(lines, height-2, 1, width-2, a.Status)
 	statusLower := strings.ToLower(a.Status)
-	if strings.Contains(statusLower, "error") || strings.Contains(statusLower, "cannot") || strings.Contains(statusLower, "not found") || strings.Contains(statusLower, "invalid") || strings.Contains(statusLower, "api 4") || strings.Contains(statusLower, "api 5") {
+	if strings.Contains(statusLower, "error") || strings.Contains(statusLower, "cannot") || strings.Contains(statusLower, "not found") || strings.Contains(statusLower, "invalid") || strings.Contains(statusLower, "no item") || strings.Contains(statusLower, "api 4") || strings.Contains(statusLower, "api 5") {
 		styles[height-2] = uiTheme.Error
 	} else {
 		styles[height-2] = uiTheme.Muted
@@ -1415,7 +1436,7 @@ func (a *App) render() {
 		footer = "↑/↓ j/k scroll  PgUp/PgDn Ctrl-U/D  Home/End  [/] tabs  Esc panels  x/? menu  q quit"
 	}
 	if a.MenuOpen {
-		footer = "↑/↓ j/k select  Enter choose  Esc close menu"
+		footer = "↑/↓ j/k select  Enter/Space choose  Esc/q close menu"
 	}
 	putLine(lines, height-1, 1, width-2, footer)
 	styles[height-1] = uiTheme.Key
@@ -1612,23 +1633,79 @@ func readKey() (string, error) {
 	return string(one[0]), nil
 }
 
-func runExternal(term *Terminal, command string, args ...string) {
+func runExternal(term *Terminal, command string, args ...string) error {
 	term.suspend()
 	cmd := exec.Command(command, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	_ = cmd.Run()
-	_ = term.resume()
+	err := cmd.Run()
+	// A command's non-zero exit status is not a launcher failure. This
+	// matches subprocess.run(..., check=False) in the Python implementation.
+	if _, exited := err.(*exec.ExitError); exited {
+		err = nil
+	}
+	if resumeErr := term.resume(); err == nil {
+		err = resumeErr
+	}
+	return err
 }
 
-func (a *App) filterPrompt(term *Terminal) {
-	term.suspend()
-	fmt.Printf("Filter [%s]: ", a.Filter)
-	reader := bufio.NewReader(os.Stdin)
-	value, _ := reader.ReadString('\n')
-	a.Filter = strings.TrimSpace(value)
-	_ = term.resume()
-	a.Selected[a.Mode] = 0
-	a.refresh("")
+func readRawByte() (byte, error) {
+	var value [1]byte
+	for {
+		n, err := os.Stdin.Read(value[:])
+		if n > 0 {
+			return value[0], nil
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (a *App) filterPrompt() {
+	original := a.Filter
+	value := []byte(original)
+	width, height := terminalSize()
+	theme := loadUITheme()
+	renderPrompt := func() {
+		text := "Filter: " + string(value)
+		fmt.Printf("\x1b[%d;%dH\x1b[1m%s%s\x1b[0m\x1b[K", height-1, 2, theme.Normal, clip(text, width-2))
+		cursorColumn := 2 + len([]rune(text))
+		if cursorColumn > width {
+			cursorColumn = width
+		}
+		fmt.Printf("\x1b[%d;%dH\x1b[?25h", height-1, cursorColumn)
+	}
+	renderPrompt()
+	for {
+		key, err := readRawByte()
+		if err != nil {
+			fmt.Print("\x1b[?25l")
+			return
+		}
+		switch key {
+		case 3, 27:
+			a.Filter = original
+			fmt.Print("\x1b[?25l")
+			return
+		case 8, 127:
+			if len(value) > 0 {
+				_, size := utf8.DecodeLastRune(value)
+				value = value[:len(value)-size]
+			}
+		case 10, 13:
+			a.Filter = strings.TrimSpace(string(value))
+			a.Selected[a.Mode] = 0
+			fmt.Print("\x1b[?25l")
+			a.refresh("")
+			return
+		default:
+			if key >= 32 {
+				value = append(value, key)
+			}
+		}
+		renderPrompt()
+	}
 }
 
 func (a *App) confirm(term *Terminal, action string) bool {
@@ -1736,12 +1813,20 @@ func runTUI(client *PodmanClient) error {
 					app.toggleHideStopped()
 				case "shell", "attach":
 					if item := app.current(); item != nil {
+						var externalErr error
 						if action == "shell" {
-							runExternal(term, "podman", "exec", "-it", item.Name, "sh")
+							externalErr = runExternal(term, "podman", "exec", "-it", item.Name, "sh")
 						} else {
-							runExternal(term, "podman", "attach", item.Name)
+							externalErr = runExternal(term, "podman", "attach", item.Name)
 						}
 						app.refresh(item.ID)
+						if externalErr != nil {
+							verb := "attach to container"
+							if action == "shell" {
+								verb = "open shell"
+							}
+							app.Status = fmt.Sprintf("Cannot %s: %v", verb, externalErr)
+						}
 					}
 				case "stop", "remove", "kill":
 					if app.confirm(term, action) {
@@ -1826,7 +1911,7 @@ func runTUI(client *PodmanClient) error {
 			app.cycleTab(1)
 		case "filter":
 			if !app.FocusMain {
-				app.filterPrompt(term)
+				app.filterPrompt()
 			}
 		case "config":
 			app.loadInspect("config")
@@ -1842,15 +1927,21 @@ func runTUI(client *PodmanClient) error {
 		case "attach":
 			if !app.FocusMain && app.Mode == "containers" {
 				if item := app.current(); item != nil {
-					runExternal(term, "podman", "attach", item.Name)
+					externalErr := runExternal(term, "podman", "attach", item.Name)
 					app.refresh(item.ID)
+					if externalErr != nil {
+						app.Status = fmt.Sprintf("Cannot attach to container: %v", externalErr)
+					}
 				}
 			}
 		case "shell":
 			if !app.FocusMain && app.Mode == "containers" {
 				if item := app.current(); item != nil {
-					runExternal(term, "podman", "exec", "-it", item.Name, "sh")
+					externalErr := runExternal(term, "podman", "exec", "-it", item.Name, "sh")
 					app.refresh(item.ID)
+					if externalErr != nil {
+						app.Status = fmt.Sprintf("Cannot open shell: %v", externalErr)
+					}
 				}
 			}
 		case "hide":

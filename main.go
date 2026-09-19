@@ -1468,6 +1468,7 @@ func printFrame(lines, styles []string, regions [][]textRegion) {
 			rowRegions = regions[index]
 		}
 		frame.WriteString(styleLine(line, base, rowRegions))
+		frame.WriteString("\x1b[K")
 		if index < len(lines)-1 {
 			frame.WriteString("\r\n")
 		}
@@ -1635,12 +1636,40 @@ func (a *App) confirm(term *Terminal, action string) bool {
 	if item == nil {
 		return false
 	}
-	term.suspend()
-	fmt.Printf("%s %s? [y/N] ", strings.Title(action), item.Name)
-	reader := bufio.NewReader(os.Stdin)
-	value, _ := reader.ReadString('\n')
-	_ = term.resume()
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "y")
+	a.render()
+	uiTheme := loadUITheme()
+	width, height := terminalSize()
+	prompt := strings.Title(action) + " " + item.Name + "?"
+	boxWidth := min(max(40, len([]rune(prompt))+8), max(40, width-6))
+	boxHeight := min(7, max(5, height-2))
+	top := max(1, (height-boxHeight)/2)
+	left := max(2, (width-boxWidth)/2)
+	writeOverlay := func(row, column, available int, text, style string) {
+		fmt.Printf("\x1b[%d;%dH%s%s\x1b[0m", row+1, column+1, style, clip(text, available))
+	}
+	writeOverlay(top, left, boxWidth, boxLine(boxWidth, '┌', '┐'), uiTheme.Title)
+	for row := top + 1; row < top+boxHeight-1; row++ {
+		writeOverlay(row, left, boxWidth, " "+strings.Repeat(" ", boxWidth-2)+" ", uiTheme.Selected)
+	}
+	writeOverlay(top+boxHeight-1, left, boxWidth, boxLine(boxWidth, '└', '┘'), uiTheme.Title)
+	writeOverlay(top, left+2, boxWidth-4, "Confirm action", uiTheme.Title)
+	messageLeft := left + max(2, (boxWidth-len([]rune(prompt)))/2)
+	writeOverlay(top+2, messageLeft, boxWidth-(messageLeft-left), prompt, uiTheme.Selected)
+	controls := "Y/Enter confirm   N/Esc cancel"
+	controlsLeft := left + max(2, (boxWidth-len([]rune(controls)))/2)
+	writeOverlay(top+4, controlsLeft, boxWidth-(controlsLeft-left), controls, uiTheme.Key)
+	for {
+		key, err := readKey()
+		if err != nil {
+			return false
+		}
+		switch key {
+		case "y", "enter":
+			return true
+		case "n", "q", "esc":
+			return false
+		}
+	}
 }
 
 func runTUI(client *PodmanClient) error {
@@ -1717,6 +1746,7 @@ func runTUI(client *PodmanClient) error {
 				case "stop", "remove", "kill":
 					if app.confirm(term, action) {
 						app.Status = strings.Title(action) + "..."
+						app.render()
 						app.perform(action)
 					}
 				default:
@@ -1839,6 +1869,8 @@ func runTUI(client *PodmanClient) error {
 				}
 				if key == "stop" || key == "kill" || key == "remove" {
 					if app.confirm(term, key) {
+						app.Status = strings.Title(key) + "..."
+						app.render()
 						app.perform(key)
 					}
 				} else {

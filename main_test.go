@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestContainerItemAndPorts(t *testing.T) {
@@ -97,8 +99,8 @@ func TestTUIRequiresTTY(t *testing.T) {
 	if isTTY() {
 		t.Skip("test process has a tty")
 	}
-	if err := runTUI(NewPodmanClient("/tmp/missing.sock")); err == nil || !strings.Contains(err.Error(), "interactive terminal") {
-		t.Fatalf("runTUI error = %v", err)
+	if err := runBubbleTUI(NewPodmanClient("/tmp/missing.sock")); err == nil || !strings.Contains(err.Error(), "interactive terminal") {
+		t.Fatalf("runBubbleTUI error = %v", err)
 	}
 }
 
@@ -174,6 +176,60 @@ func TestNavigationAndContainerMenuParity(t *testing.T) {
 	for label, present := range wanted {
 		if !present {
 			t.Errorf("menu entry %q missing", label)
+		}
+	}
+}
+
+func TestBubbleTeaKeyHandlingPreservesTUIActions(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "demo", State: "running"}}
+	model := bubbleModel{app: app, width: 100, height: 30, refreshAfter: refreshInterval}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if !app.MenuOpen || app.MenuIndex != 0 {
+		t.Fatalf("menu state = open:%v index:%d", app.MenuOpen, app.MenuIndex)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if app.MenuIndex != 1 {
+		t.Fatalf("menu index = %d, want 1", app.MenuIndex)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	if app.MenuOpen {
+		t.Fatal("escape did not close menu")
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if app.ConfirmAction != "stop" {
+		t.Fatalf("confirm action = %q, want stop", app.ConfirmAction)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if app.ConfirmAction != "" {
+		t.Fatal("cancel did not close confirmation")
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	if !app.FilterInput {
+		t.Fatal("filter input did not open")
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	if app.FilterDraft != "d" {
+		t.Fatalf("filter draft = %q, want d", app.FilterDraft)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	if app.FilterInput {
+		t.Fatal("escape did not close filter input")
+	}
+}
+
+func TestBubbleTeaViewIncludesNativeLayoutAndConfirmation(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "demo", State: "running"}}
+	app.loadSummary()
+	app.ConfirmAction = "stop"
+	view := (bubbleModel{app: app, width: 100, height: 30}).View()
+	for _, want := range []string{"native Libpod", "Confirm action", "Stop demo?", "Y/Enter confirm"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("Bubble Tea view does not contain %q", want)
 		}
 	}
 }

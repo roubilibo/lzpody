@@ -21,6 +21,7 @@ It does not invoke Docker CLI or require a Docker compatibility layer.
 - Name/state/image filter.
 - Lazydocker-style stacked resource panels, focused detail view, scrolling, and action menu.
 - A single Go binary with no runtime dependencies beyond Podman and a Unix socket.
+- Bubble Tea event loop with resize-aware diff rendering and no full-screen redraw flicker.
 
 ## Run
 

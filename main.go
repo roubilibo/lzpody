@@ -61,6 +61,17 @@ func addRegion(regions [][]textRegion, row, start, end int, style string) {
 	regions[row] = append(regions[row], textRegion{start: start, end: end, style: style})
 }
 
+func addTextRegion(regions [][]textRegion, row, column, width int, text, style string) {
+	if width <= 0 {
+		return
+	}
+	runes := []rune(cleanText(text))
+	if len(runes) > width {
+		runes = runes[:width]
+	}
+	addRegion(regions, row, column, column+len(runes), style)
+}
+
 func styleLine(line, base string, regions []textRegion) string {
 	runes := []rune(line)
 	if len(runes) == 0 {
@@ -739,6 +750,9 @@ type App struct {
 	MenuOpen       bool
 	MenuIndex      int
 	Dirty          bool
+	ConfirmAction  string
+	FilterInput    bool
+	FilterDraft    string
 }
 
 func NewApp(client *PodmanClient) *App {
@@ -1116,6 +1130,31 @@ func (a *App) menuEntries() [][2]string {
 	return [][2]string{{"Config [i]", "config"}, {"Remove [d]", "remove"}}
 }
 
+func (a *App) openMenu() {
+	a.MenuOpen = true
+	a.MenuIndex = 0
+}
+
+func (a *App) closeMenu() {
+	a.MenuOpen = false
+}
+
+func (a *App) moveMenu(delta int) {
+	entries := a.menuEntries()
+	if len(entries) == 0 {
+		return
+	}
+	a.MenuIndex = max(0, min(len(entries)-1, a.MenuIndex+delta))
+}
+
+func (a *App) selectedMenuAction() string {
+	entries := a.menuEntries()
+	if a.MenuIndex < 0 || a.MenuIndex >= len(entries) {
+		return ""
+	}
+	return entries[a.MenuIndex][1]
+}
+
 func (a *App) perform(action string) {
 	item := a.current()
 	if item == nil {
@@ -1175,6 +1214,8 @@ func min(a, b int) int {
 	return b
 }
 
+// Terminal is retained for the legacy test helper below; the executable uses
+// Bubble Tea's terminal lifecycle and never enters this raw-mode path.
 type Terminal struct{ state string }
 
 func (t *Terminal) enter() error {
@@ -1186,28 +1227,27 @@ func (t *Terminal) enter() error {
 		return fmt.Errorf("cannot configure terminal: %w", err)
 	}
 	t.state = strings.TrimSpace(state)
-	if _, err := runOutput("stty", "raw", "-echo", "min", "0", "time", "2"); err != nil {
-		return err
-	}
-	fmt.Print("\x1b[?25l")
-	return nil
+	_, err = runOutput("stty", "raw", "-echo", "min", "0", "time", "2")
+	return err
 }
+
 func (t *Terminal) restore() {
 	if t.state != "" {
 		_, _ = runOutput("stty", t.state)
 		t.state = ""
 	}
-	// Leave the shell on a clean screen after curses-like rendering ends.
-	fmt.Print("\x1b[0m\x1b[?25h\x1b[2J\x1b[H")
 }
+
 func (t *Terminal) suspend()      { t.restore() }
 func (t *Terminal) resume() error { return t.enter() }
+
 func runOutput(name string, args ...string) (string, error) {
 	command := exec.Command(name, args...)
 	command.Stdin = os.Stdin
 	output, err := command.Output()
 	return string(output), err
 }
+
 func isTTY() bool {
 	info, err := os.Stdin.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
@@ -1258,7 +1298,10 @@ func putLine(lines []string, row, column, width int, text string) {
 		return
 	}
 	prefix := []rune(lines[row])
-	value := []rune(clip(text, width))
+	value := []rune(cleanText(text))
+	if len(value) > width {
+		value = value[:width]
+	}
 	for i, char := range value {
 		index := column + i
 		if index >= len(prefix) {
@@ -1277,6 +1320,10 @@ func boxLine(width int, left, right rune) string {
 
 func (a *App) render() {
 	width, height := terminalSize()
+	fmt.Print("\x1b[H" + a.frame(width, height) + "\x1b[J")
+}
+
+func (a *App) frame(width, height int) string {
 	uiTheme := loadUITheme()
 	lines := make([]string, height)
 	styles := make([]string, height)
@@ -1287,18 +1334,22 @@ func (a *App) render() {
 	}
 	if height < 22 || width < 70 {
 		lines[0] = clip("Terminal too small. Minimum size is 70x22.", width)
-		printFrame(lines, styles, regions)
-		return
+		return frameText(lines, styles, regions)
 	}
-	putLine(lines, 0, 0, width, " lzpody ")
-	putLine(lines, 0, 14, width-14, "native Libpod · "+uiTheme.Name)
-	addRegion(regions, 0, 0, 9, uiTheme.Title)
-	addRegion(regions, 0, 14, width, uiTheme.Muted)
-	styles[0] = uiTheme.Normal
-	putLine(lines, 1, width-27, 25, "[F5] refresh  [q] quit")
-	styles[1] = uiTheme.Muted
+	headerTitle := " lzpody "
+	headerSubtitle := "native Libpod · " + uiTheme.Name
+	putLine(lines, 0, 0, width, headerTitle)
+	putLine(lines, 0, 14, width-14, headerSubtitle)
+	addTextRegion(regions, 0, 0, width, headerTitle, uiTheme.Title)
+	addTextRegion(regions, 0, 14, width-14, headerSubtitle, uiTheme.Muted)
+	refreshText := "[F5] refresh  [q] quit"
+	refreshColumn := max(1, width-25)
+	putLine(lines, 1, refreshColumn, width-refreshColumn, refreshText)
+	addTextRegion(regions, 1, refreshColumn, width-refreshColumn, refreshText, uiTheme.Muted)
 	if a.Filter != "" {
-		putLine(lines, 1, 1, width/2, "Filter: "+a.Filter)
+		filterText := "Filter: " + a.Filter
+		putLine(lines, 1, 1, width/2, filterText)
+		addTextRegion(regions, 1, 1, width/2, filterText, uiTheme.Muted)
 	}
 	top, bottom := 2, height-3
 	leftWidth := max(32, width/3)
@@ -1321,13 +1372,15 @@ func (a *App) render() {
 		}
 		addRegion(regions, panelTop, 1, leftWidth+1, panelStyle)
 		putLine(lines, panelTop, 1, leftWidth, boxLine(leftWidth, '┌', '┐'))
-		putLine(lines, panelTop, 3, leftWidth-4, fmt.Sprintf("[%d] %s (%d)", index+1, resourceLabels[mode], len(a.Items[mode])))
+		panelTitle := fmt.Sprintf("[%d] %s (%d)", index+1, resourceLabels[mode], len(a.Items[mode]))
+		putLine(lines, panelTop, 3, leftWidth-4, panelTitle)
+		addTextRegion(regions, panelTop, 3, leftWidth-4, panelTitle, panelStyle)
 		styles[panelTop] = panelStyle
 		for r := 1; r < panelH-1; r++ {
 			putLine(lines, panelTop+r, 1, leftWidth, "│")
 			putLine(lines, panelTop+r, leftWidth, 1, "│")
-			addRegion(regions, panelTop+r, 1, leftWidth+1, panelStyle)
-			styles[panelTop+r] = panelStyle
+			addRegion(regions, panelTop+r, 1, 2, panelStyle)
+			addRegion(regions, panelTop+r, leftWidth, leftWidth+1, panelStyle)
 		}
 		putLine(lines, panelTop+panelH-1, 1, leftWidth, boxLine(leftWidth, '└', '┘'))
 		addRegion(regions, panelTop+panelH-1, 1, leftWidth+1, panelStyle)
@@ -1358,7 +1411,8 @@ func (a *App) render() {
 			if start+row == selected && mode == a.Mode && !a.FocusMain {
 				label = "> " + label
 			}
-			putLine(lines, panelTop+1+row, 2, leftWidth-3, label)
+			labelWidth := leftWidth - 3
+			putLine(lines, panelTop+1+row, 2, labelWidth, label)
 			itemStyle := uiTheme.Stopped
 			if strings.ToLower(item.State) == "running" {
 				itemStyle = uiTheme.Running
@@ -1366,29 +1420,29 @@ func (a *App) render() {
 			if start+row == selected && mode == a.Mode && !a.FocusMain {
 				itemStyle = uiTheme.Selected
 			}
-			addRegion(regions, panelTop+1+row, 1, leftWidth+1, itemStyle)
-			styles[panelTop+1+row] = itemStyle
+			addTextRegion(regions, panelTop+1+row, 2, labelWidth, label, itemStyle)
 		}
 		if len(a.Items[mode]) == 0 && panelH >= 4 {
-			putLine(lines, panelTop+1, 3, leftWidth-4, "(empty)")
-			addRegion(regions, panelTop+1, 1, leftWidth+1, uiTheme.Muted)
+			emptyText := "(empty)"
+			putLine(lines, panelTop+1, 3, leftWidth-4, emptyText)
+			addTextRegion(regions, panelTop+1, 3, leftWidth-4, emptyText, uiTheme.Muted)
 		}
 	}
-	for row := top; row <= bottom; row++ {
-		addRegion(regions, row, rightX, rightX+rightWidth, uiTheme.Border)
-	}
-	putLine(lines, top, rightX, rightWidth, boxLine(rightWidth, '┌', '┐'))
 	mainStyle := uiTheme.Border
 	if a.FocusMain {
 		mainStyle = uiTheme.Title
 	}
+	putLine(lines, top, rightX, rightWidth, boxLine(rightWidth, '┌', '┐'))
+	addRegion(regions, top, rightX, rightX+rightWidth, mainStyle)
 	styles[top] = mainStyle
 	for r := 1; r < bottom-top; r++ {
 		putLine(lines, top+r, rightX, 1, "│")
 		putLine(lines, top+r, rightX+rightWidth-1, 1, "│")
-		styles[top+r] = mainStyle
+		addRegion(regions, top+r, rightX, rightX+1, mainStyle)
+		addRegion(regions, top+r, rightX+rightWidth-1, rightX+rightWidth, mainStyle)
 	}
 	putLine(lines, bottom, rightX, rightWidth, boxLine(rightWidth, '└', '┘'))
+	addRegion(regions, bottom, rightX, rightX+rightWidth, mainStyle)
 	styles[bottom] = mainStyle
 	item := a.current()
 	title := "Details"
@@ -1401,9 +1455,9 @@ func (a *App) render() {
 		last := min(len(a.DetailLines), a.DetailScroll+max(1, bottom-top-2))
 		position = fmt.Sprintf("  (%d-%d/%d)", first, last, len(a.DetailLines))
 	}
-	putLine(lines, top, rightX+2, rightWidth-4, title+" ["+a.DetailMode+"]"+position)
-	addRegion(regions, top, rightX, rightX+rightWidth, uiTheme.Title)
-	styles[top] = uiTheme.Title
+	detailTitle := title + " [" + a.DetailMode + "]" + position
+	putLine(lines, top, rightX+2, rightWidth-4, detailTitle)
+	addTextRegion(regions, top, rightX+2, rightWidth-4, detailTitle, uiTheme.Title)
 	tabs := []string{}
 	for _, tab := range a.detailTabs() {
 		label := strings.Title(tab)
@@ -1413,24 +1467,22 @@ func (a *App) render() {
 			tabs = append(tabs, label)
 		}
 	}
-	putLine(lines, top+1, rightX+2, rightWidth-4, strings.Join(tabs, "  "))
-	addRegion(regions, top+1, rightX, rightX+rightWidth, uiTheme.Key)
-	styles[top+1] = uiTheme.Key
+	tabText := strings.Join(tabs, "  ")
+	putLine(lines, top+1, rightX+2, rightWidth-4, tabText)
+	addTextRegion(regions, top+1, rightX+2, rightWidth-4, tabText, uiTheme.Key)
 	detailRows := bottom - top - 2
 	a.DetailViewRows = max(1, detailRows)
 	start := max(0, min(a.DetailScroll, max(0, len(a.DetailLines)-detailRows)))
 	for index, line := range a.DetailLines[start:min(start+detailRows, len(a.DetailLines))] {
 		putLine(lines, top+2+index, rightX+2, rightWidth-4, line)
-		addRegion(regions, top+2+index, rightX, rightX+rightWidth, uiTheme.Normal)
-		styles[top+2+index] = uiTheme.Normal
 	}
 	putLine(lines, height-2, 1, width-2, a.Status)
 	statusLower := strings.ToLower(a.Status)
+	statusStyle := uiTheme.Muted
 	if strings.Contains(statusLower, "error") || strings.Contains(statusLower, "cannot") || strings.Contains(statusLower, "not found") || strings.Contains(statusLower, "invalid") || strings.Contains(statusLower, "no item") || strings.Contains(statusLower, "api 4") || strings.Contains(statusLower, "api 5") {
-		styles[height-2] = uiTheme.Error
-	} else {
-		styles[height-2] = uiTheme.Muted
+		statusStyle = uiTheme.Error
 	}
+	addTextRegion(regions, height-2, 1, width-2, a.Status, statusStyle)
 	footer := "←/→ h/l panels  ↑/↓ j/k items  Tab  1-5 focus  Enter main  [/] tabs  x/? menu  / filter  q quit"
 	if a.FocusMain {
 		footer = "↑/↓ j/k scroll  PgUp/PgDn Ctrl-U/D  Home/End  [/] tabs  Esc panels  x/? menu  q quit"
@@ -1439,7 +1491,7 @@ func (a *App) render() {
 		footer = "↑/↓ j/k select  Enter/Space choose  Esc/q close menu"
 	}
 	putLine(lines, height-1, 1, width-2, footer)
-	styles[height-1] = uiTheme.Key
+	addTextRegion(regions, height-1, 1, width-2, footer, uiTheme.Key)
 	if a.MenuOpen {
 		entries := a.menuEntries()
 		boxWidth := min(42, max(24, width-6))
@@ -1474,7 +1526,66 @@ func (a *App) render() {
 			}
 		}
 	}
-	printFrame(lines, styles, regions)
+	if a.FilterInput {
+		filterText := "Filter: " + a.FilterDraft
+		putLine(lines, height-2, 1, width-2, filterText)
+		addTextRegion(regions, height-2, 1, width-2, filterText, "\x1b[1m"+uiTheme.Normal)
+	}
+	if a.ConfirmAction != "" {
+		drawConfirmOverlay(lines, styles, regions, width, height, uiTheme, a)
+	}
+	return frameText(lines, styles, regions)
+}
+
+func drawConfirmOverlay(lines, styles []string, regions [][]textRegion, width, height int, theme UITheme, app *App) {
+	item := app.current()
+	if item == nil {
+		return
+	}
+	prompt := strings.Title(app.ConfirmAction) + " " + item.Name + "?"
+	boxWidth := min(max(40, len([]rune(prompt))+8), max(40, width-6))
+	boxHeight := min(7, max(5, height-2))
+	top := max(1, (height-boxHeight)/2)
+	left := max(2, (width-boxWidth)/2)
+	putLine(lines, top, left, boxWidth, boxLine(boxWidth, '┌', '┐'))
+	addRegion(regions, top, left, left+boxWidth, theme.Title)
+	styles[top] = theme.Title
+	for row := top + 1; row < top+boxHeight-1; row++ {
+		putLine(lines, row, left, boxWidth, " "+strings.Repeat(" ", boxWidth-2)+" ")
+		addRegion(regions, row, left+1, left+boxWidth-1, theme.Selected)
+	}
+	putLine(lines, top+boxHeight-1, left, boxWidth, boxLine(boxWidth, '└', '┘'))
+	addRegion(regions, top+boxHeight-1, left, left+boxWidth, theme.Title)
+	styles[top+boxHeight-1] = theme.Title
+	title := "Confirm action"
+	putLine(lines, top, left+2, boxWidth-4, title)
+	addTextRegion(regions, top, left+2, boxWidth-4, title, theme.Title)
+	messageLeft := left + max(2, (boxWidth-len([]rune(prompt)))/2)
+	putLine(lines, top+2, messageLeft, boxWidth-(messageLeft-left), prompt)
+	addTextRegion(regions, top+2, messageLeft, boxWidth-(messageLeft-left), prompt, "\x1b[1m"+theme.Selected)
+	controls := "Y/Enter confirm   N/Esc cancel"
+	controlsLeft := left + max(2, (boxWidth-len([]rune(controls)))/2)
+	putLine(lines, top+4, controlsLeft, boxWidth-(controlsLeft-left), controls)
+	addTextRegion(regions, top+4, controlsLeft, boxWidth-(controlsLeft-left), controls, theme.Key)
+}
+
+func frameText(lines, styles []string, regions [][]textRegion) string {
+	var frame strings.Builder
+	for index, line := range lines {
+		base := ""
+		if index < len(styles) {
+			base = styles[index]
+		}
+		var rowRegions []textRegion
+		if index < len(regions) {
+			rowRegions = regions[index]
+		}
+		frame.WriteString(styleLine(line, base, rowRegions))
+		if index < len(lines)-1 {
+			frame.WriteString("\r\n")
+		}
+	}
+	return frame.String()
 }
 
 func printFrame(lines, styles []string, regions [][]textRegion) {
@@ -2020,7 +2131,7 @@ func main() {
 		fmt.Println("lzpody - native Podman Libpod TUI\n\nUsage: lzpody [--version|--help]\n\nEnvironment: LZPODY_SOCKET, LZPODY_API_VERSION")
 		return
 	}
-	if err := runTUI(NewPodmanClient("")); err != nil {
+	if err := runBubbleTUI(NewPodmanClient("")); err != nil {
 		fmt.Fprintln(os.Stderr, "lzpody:", err)
 		os.Exit(1)
 	}

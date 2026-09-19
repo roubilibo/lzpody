@@ -88,6 +88,9 @@ type containerFormField struct {
 }
 
 type containerFormState struct {
+	action      string
+	title       string
+	tabs        []string
 	fields      []containerFormField
 	tab         int
 	activeField int

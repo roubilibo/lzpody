@@ -634,6 +634,26 @@ func TestContainerFormUsesTabbedPanels(t *testing.T) {
 	}
 }
 
+func TestNetworkFormUsesDetailPanel(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.beginPrompt("create_network")
+	if app.ContainerForm == nil || app.ContainerForm.action != "create_network" || len(app.ContainerForm.fields) != 8 {
+		t.Fatalf("network form state = %+v", app.ContainerForm)
+	}
+	model := newBubbleModel(app)
+	model.width, model.height = 100, 30
+	model.updateContainerForm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("frontend")})
+	model.updateContainerForm(tea.KeyMsg{Type: tea.KeyTab})
+	model.updateContainerForm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("bridge")})
+	if got := app.ContainerForm.values(); got[0] != "frontend" || got[1] != "bridge" {
+		t.Fatalf("network form values = %v", got)
+	}
+	view := model.View()
+	if !strings.Contains(view, "Create network [form]") || !strings.Contains(view, "[Network]") {
+		t.Fatalf("network form is not rendered in the detail panel:\n%s", view)
+	}
+}
+
 func TestBubbleTeaKeyHandlingPreservesTUIActions(t *testing.T) {
 	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
 	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "demo", State: "running"}}

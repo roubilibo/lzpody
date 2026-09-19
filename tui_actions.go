@@ -8,8 +8,15 @@ import (
 )
 
 func (a *App) beginPrompt(action string) {
-	if action == "run" {
-		a.ContainerForm = newContainerForm()
+	var form *containerFormState
+	switch action {
+	case "run":
+		form = newContainerForm()
+	case "create_network":
+		form = newNetworkForm()
+	}
+	if form != nil {
+		a.ContainerForm = form
 		a.Prompt = nil
 		a.MenuOpen = false
 		a.FocusMain = true
@@ -72,7 +79,7 @@ func (a *App) beginPrompt(action string) {
 }
 
 func newContainerForm() *containerFormState {
-	return &containerFormState{fields: []containerFormField{
+	return &containerFormState{action: "run", title: "Create container", tabs: []string{"Basic", "Network", "Runtime", "Security"}, fields: []containerFormField{
 		{label: "Image", hint: "reference, e.g. alpine:latest", tab: 0},
 		{label: "Name", hint: "container name, e.g. web", tab: 0},
 		{label: "Command", hint: "command, e.g. nginx -g 'daemon off;'", tab: 0},
@@ -92,6 +99,19 @@ func newContainerForm() *containerFormState {
 		{label: "Labels", hint: "key=value, e.g. app=web", tab: 3},
 		{label: "Devices", hint: "host:container[:rwm], e.g. /dev/kvm:/dev/kvm:rwm", tab: 3},
 		{label: "Security options", hint: "option, e.g. no-new-privileges", tab: 3},
+	}, activeField: 0}
+}
+
+func newNetworkForm() *containerFormState {
+	return &containerFormState{action: "create_network", title: "Create network", tabs: []string{"Network"}, fields: []containerFormField{
+		{label: "Name", hint: "network name, e.g. frontend", tab: 0},
+		{label: "Driver", hint: "bridge, macvlan, or ipvlan", tab: 0},
+		{label: "Subnets", hint: "CIDR list, e.g. 10.89.0.0/24", tab: 0},
+		{label: "Gateways", hint: "gateway list, e.g. 10.89.0.1", tab: 0},
+		{label: "IP ranges", hint: "range list, e.g. 10.89.0.10/28", tab: 0},
+		{label: "IPv6", hint: "yes or no", tab: 0},
+		{label: "Internal", hint: "yes or no", tab: 0},
+		{label: "Labels | options", hint: "key=value | key=value, e.g. app=web | mtu=1500", tab: 0},
 	}, activeField: 0}
 }
 
@@ -179,16 +199,16 @@ func (m Model) updateContainerForm(message tea.KeyMsg) tea.Cmd {
 		m.app.CursorVisible = false
 		m.app.DetailMode = "summary"
 		m.app.FocusMain = false
-		return m.promptCommand("run", values)
+		return m.promptCommand(form.action, values)
 	case "tab", "enter", "down":
 		moveField(1)
 	case "shift+tab", "up":
 		moveField(-1)
 	case "ctrl+right", "]":
-		form.tab = (form.tab + 1) % 4
+		form.tab = (form.tab + 1) % len(form.tabs)
 		form.activeField = form.fieldIndexes(form.tab)[0]
 	case "ctrl+left", "[":
-		form.tab = (form.tab + 3) % 4
+		form.tab = (form.tab + len(form.tabs) - 1) % len(form.tabs)
 		form.activeField = form.fieldIndexes(form.tab)[0]
 	case "backspace", "delete":
 		field := &form.fields[form.activeField]

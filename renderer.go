@@ -261,8 +261,9 @@ func (a *App) frame(width, height int) string {
 	putLine(lines, bottom, rightX, rightWidth, boxLine(rightWidth, '└', '┘'))
 	addRegion(regions, bottom, rightX, rightX+rightWidth, mainStyle)
 	if a.ContainerForm != nil {
-		putLine(lines, top, rightX+2, rightWidth-4, "Create container [form]")
-		addTextRegion(regions, top, rightX+2, rightWidth-4, "Create container [form]", uiTheme.Title)
+		formTitle := a.ContainerForm.title + " [form]"
+		putLine(lines, top, rightX+2, rightWidth-4, formTitle)
+		addTextRegion(regions, top, rightX+2, rightWidth-4, formTitle, uiTheme.Title)
 		drawContainerFormDetail(lines, regions, rightX+2, top+1, rightWidth-4, bottom-top-2, uiTheme, a.ContainerForm, a.CursorVisible)
 	} else {
 		item := a.current()
@@ -377,7 +378,7 @@ func drawContainerFormDetail(lines []string, regions [][]textRegion, left, top, 
 	if form == nil {
 		return
 	}
-	tabs := []string{"Basic", "Network", "Runtime", "Security"}
+	tabs := form.tabs
 	indexes := form.fieldIndexes(form.tab)
 	columns := 1
 	if width <= 4 || height <= 2 {

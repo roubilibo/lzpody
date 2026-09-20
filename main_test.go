@@ -53,8 +53,13 @@ func TestModelsAndStats(t *testing.T) {
 		t.Fatalf("network = %+v", got)
 	}
 	sample := statsPayload(map[string]any{"Stats": []any{map[string]any{"CPU": 12.5}}})
-	if numberValue(sample["CPU"]) != 12.5 || !strings.Contains(statsLines([]map[string]any{sample})[2], "12.50%") {
+	if numberValue(sample["CPU"]) != 12.5 || !strings.Contains(strings.Join(statsLines([]map[string]any{sample}), "\n"), "12.50") {
 		t.Fatalf("stats payload/lines failed: %+v", sample)
+	}
+	lines := statsLines([]map[string]any{{"CPU": 12.5, "MemPerc": 4.5}})
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "CPU (%)") || !strings.Contains(joined, "Memory (%)") || !strings.Contains(joined, "12.50") || !strings.Contains(joined, "┤") {
+		t.Fatalf("cpu stats card missing: %v", lines)
 	}
 }
 
@@ -302,9 +307,14 @@ func TestGlobalActionsAndDetailModes(t *testing.T) {
 	for _, entry := range app.menuEntries() {
 		labels[entry[1]] = true
 	}
-	for _, action := range []string{"pull", "run", "build", "push", "image_load", "image_import", "registry_login", "registry_logout", "prune_images", "prune_pods", "prune_volumes", "prune_networks", "system_prune", "create_pod", "create_volume", "create_network", "create_secret", "system_info", "events"} {
+	for _, action := range []string{"run", "system_info", "events", "system_prune"} {
 		if !labels[action] {
-			t.Errorf("global action %q is missing", action)
+			t.Errorf("container panel action %q is missing", action)
+		}
+	}
+	for _, action := range []string{"pull", "create_pod", "create_network", "create_volume", "create_secret"} {
+		if labels[action] {
+			t.Errorf("container panel contains unrelated action %q", action)
 		}
 	}
 	app.DetailMode = "system"
@@ -314,6 +324,59 @@ func TestGlobalActionsAndDetailModes(t *testing.T) {
 	app.DetailMode = "events"
 	if got := app.detailTabs(); fmt.Sprint(got) != "[events]" {
 		t.Fatalf("event tabs = %v", got)
+	}
+	app.Mode = "images"
+	app.DetailMode = "summary"
+	app.Items["images"] = []Item{{Kind: "image", ID: "i1", Name: "alpine"}}
+	if got := fmt.Sprint(app.detailTabs()); got != "[summary history config]" {
+		t.Fatalf("image tabs = %s", got)
+	}
+}
+
+func TestActionsAreScopedToResourcePanel(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	cases := []struct {
+		mode    string
+		item    Item
+		include []string
+		exclude []string
+	}{
+		{mode: "containers", item: Item{Kind: "container", ID: "c1", Name: "web"}, include: []string{"run", "shell", "exec"}, exclude: []string{"create_pod", "create_network", "image_search"}},
+		{mode: "pods", item: Item{Kind: "pod", ID: "p1", Name: "app"}, include: []string{"create_pod", "start"}, exclude: []string{"run", "create_network", "image_search"}},
+		{mode: "images", item: Item{Kind: "image", ID: "i1", Name: "alpine"}, include: []string{"pull", "image_search", "image_tag"}, exclude: []string{"run", "create_pod", "create_network", "image_history"}},
+		{mode: "volumes", item: Item{Kind: "volume", ID: "v1", Name: "data"}, include: []string{"create_volume", "volume_mount"}, exclude: []string{"run", "create_network", "image_search"}},
+		{mode: "networks", item: Item{Kind: "network", ID: "n1", Name: "frontend"}, include: []string{"create_network", "network_connect"}, exclude: []string{"run", "create_volume", "image_search"}},
+		{mode: "secrets", item: Item{Kind: "secret", ID: "s1", Name: "db"}, include: []string{"create_secret", "config"}, exclude: []string{"run", "create_network", "image_search"}},
+	}
+	for _, testCase := range cases {
+		app.Mode = testCase.mode
+		app.Items[testCase.mode] = []Item{testCase.item}
+		app.Selected[testCase.mode] = 0
+		entries := app.menuEntries()
+		actions := map[string]bool{}
+		for _, entry := range entries {
+			actions[entry[1]] = true
+		}
+		for _, action := range testCase.include {
+			if !actions[action] {
+				t.Errorf("%s panel is missing action %q", testCase.mode, action)
+			}
+		}
+		for _, action := range testCase.exclude {
+			if actions[action] {
+				t.Errorf("%s panel contains unrelated action %q", testCase.mode, action)
+			}
+		}
+	}
+	app.Mode = "networks"
+	app.DetailMode = "summary"
+	app.Items["networks"] = []Item{{Kind: "network", ID: "n1", Name: "frontend"}}
+	if got := fmt.Sprint(app.detailTabs()); got != "[summary relationships config]" {
+		t.Fatalf("network tabs = %s", got)
+	}
+	app.DetailMode = "relationships"
+	if got := fmt.Sprint(app.detailTabs()); got != "[summary relationships config]" {
+		t.Fatalf("network relationship tabs = %s", got)
 	}
 }
 
@@ -393,7 +456,7 @@ func TestStaleDetailResultIsIgnored(t *testing.T) {
 		t.Fatalf("stale result replaced detail: %v", app.DetailLines)
 	}
 	app.applyDetail(detailResult{itemID: "c1", mode: "config", requestID: 2, lines: []string{"current request"}})
-	if fmt.Sprint(app.DetailLines) != "[current request]" {
+	if len(app.DetailLines) == 0 || app.DetailLines[0] != "current request" {
 		t.Fatalf("current result was ignored: %v", app.DetailLines)
 	}
 }
@@ -472,7 +535,7 @@ func TestOmarchyThemePaletteIsLoaded(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".local/state/omarchy/current/theme.name"), []byte("demo-theme\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	colors := "accent = \"#010203\"\nforeground = \"#040506\"\nselection = \"#070809\"\nmuted = \"#0a0b0c\"\ngreen = \"#0d0e0f\"\nred = \"#101112\"\nyellow = \"#131415\"\n"
+	colors := "accent = \"#010203\"\nforeground = \"#040506\"\nselection = \"#070809\"\nmuted = \"#0a0b0c\"\ngreen = \"#0d0e0f\"\nred = \"#101112\"\nyellow = \"#131415\"\ncyan = \"#161718\"\n"
 	if err := os.WriteFile(filepath.Join(home, "omarchy/themes/demo-theme/colors.toml"), []byte(colors), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +543,7 @@ func TestOmarchyThemePaletteIsLoaded(t *testing.T) {
 	if theme.Name != "Demo Theme" {
 		t.Fatalf("theme name = %q", theme.Name)
 	}
-	if theme.Title.GetForeground() == nil || theme.Normal.GetForeground() == nil {
+	if theme.Title.GetForeground() == nil || theme.Normal.GetForeground() == nil || theme.GraphCPU.GetForeground() == nil || theme.GraphMemory.GetForeground() == nil {
 		t.Fatalf("theme colors were not applied: title=%v normal=%v", theme.Title.GetForeground(), theme.Normal.GetForeground())
 	}
 }
@@ -496,6 +559,31 @@ func TestDetailPaginationUsesVisibleRows(t *testing.T) {
 	app.pageScroll(-1)
 	if app.DetailScroll != 11 {
 		t.Fatalf("page scroll = %d, want 11", app.DetailScroll)
+	}
+}
+
+func TestSystemAndContainerConfigHaveBottomSpacer(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.DetailMode = "system"
+	app.DetailViewRows = 3
+	app.applyDetail(detailResult{mode: "system", lines: []string{"system-1", "system-2"}})
+	app.scroll(100)
+	if len(app.DetailLines) != 2+logsBottomSpacer || app.DetailScroll != logsBottomSpacer-1 {
+		t.Fatalf("system detail end = lines:%d scroll:%d", len(app.DetailLines), app.DetailScroll)
+	}
+	for _, line := range app.DetailLines[2:] {
+		if line != "" {
+			t.Fatalf("system spacer contains %q", line)
+		}
+	}
+
+	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "demo"}}
+	app.DetailMode = "config"
+	app.DetailViewRows = 3
+	app.applyDetail(detailResult{itemID: "c1", mode: "config", lines: []string{"config-1", "config-2"}})
+	app.scroll(100)
+	if len(app.DetailLines) != 2+logsBottomSpacer || app.DetailScroll != logsBottomSpacer-1 {
+		t.Fatalf("container config end = lines:%d scroll:%d", len(app.DetailLines), app.DetailScroll)
 	}
 }
 

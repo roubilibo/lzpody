@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/creack/pty v1.1.18
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
+	github.com/jesseduffield/asciigraph v0.4.1
 )
 
 require (

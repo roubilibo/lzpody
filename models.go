@@ -6,6 +6,9 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/jesseduffield/asciigraph"
 )
 
 type Item struct {
@@ -345,6 +348,10 @@ func sparkline(values []float64, width int) string {
 }
 
 func statsLines(history []map[string]any) []string {
+	return statsLinesForWidth(history, 34)
+}
+
+func statsLinesForWidth(history []map[string]any, width int) []string {
 	if len(history) == 0 {
 		return []string{"No statistics available."}
 	}
@@ -362,16 +369,55 @@ func statsLines(history []map[string]any) []string {
 		memoryValues = append(memoryValues, valueFor(sample, "MemPerc", ""))
 	}
 	cpu, memory := cpuValues[len(cpuValues)-1], memoryValues[len(memoryValues)-1]
-	return []string{
-		"Live container statistics", "",
-		fmt.Sprintf("CPU       %6.2f%%  [%s]", cpu, gauge(cpu, 20)),
-		"          " + sparkline(cpuValues, 32),
-		fmt.Sprintf("Memory    %6.2f%%  [%s]", memory, gauge(memory, 20)),
-		"          " + sparkline(memoryValues, 32),
-		fmt.Sprintf("Usage     %s / %s", bytesText(latest["MemUsage"]), bytesText(latest["MemLimit"])),
+	graphWidth := max(20, min(56, width-8))
+	lines := []string{"Resource statistics", ""}
+	lines = append(lines, metricGraph("CPU (%)", cpu, cpuValues, graphWidth, 10)...)
+	lines = append(lines, "")
+	lines = append(lines, metricGraph("Memory (%)", memory, memoryValues, graphWidth, 10)...)
+	lines = append(lines, "")
+	return append(lines,
+		fmt.Sprintf("Memory    %s / %s", bytesText(latest["MemUsage"]), bytesText(latest["MemLimit"])),
 		fmt.Sprintf("PIDs      %d", int(numberValue(latest["PIDs"]))),
-		"Block I/O in   " + bytesText(latest["BlockInput"]),
-		"Block I/O out  " + bytesText(latest["BlockOutput"]), "",
+		"Block I/O in   "+bytesText(latest["BlockInput"]),
+		"Block I/O out  "+bytesText(latest["BlockOutput"]), "",
 		fmt.Sprintf("Samples: %d  ·  refresh interval: %gs", len(history), refreshInterval.Seconds()),
+	)
+}
+
+// metricGraph delegates plotting to the same asciigraph library used by
+// LazyDocker. It auto-scales from the observed samples and draws axis labels,
+// stepped line segments, and a caption below the graph.
+func metricGraph(title string, current float64, values []float64, width, height int) []string {
+	if width <= 0 || height <= 0 {
+		return nil
 	}
+	if len(values) > width {
+		values = values[len(values)-width:]
+	}
+	if len(values) == 0 {
+		values = []float64{0}
+	}
+	plotValues := append([]float64(nil), values...)
+	if allEqual(plotValues) {
+		// asciigraph needs a non-zero range. Keep a flat sample visible with a
+		// tiny synthetic next point; the caption still reports the real value.
+		epsilon := math.Max(math.Abs(plotValues[0])*0.01, 0.01)
+		plotValues = append(plotValues, plotValues[0]+epsilon)
+	}
+	duration := time.Duration(max(0, len(values)-1)) * refreshInterval
+	caption := fmt.Sprintf("%s: %.2f (%s)", title, current, duration.Round(time.Second))
+	plot := asciigraph.Plot(plotValues, asciigraph.Height(height), asciigraph.Width(width), asciigraph.Caption(caption))
+	return strings.Split(plot, "\n")
+}
+
+func allEqual(values []float64) bool {
+	if len(values) < 2 {
+		return true
+	}
+	for _, value := range values[1:] {
+		if value != values[0] {
+			return false
+		}
+	}
+	return true
 }

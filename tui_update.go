@@ -100,7 +100,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		var detailCommand tea.Cmd
-		if len(m.app.DetailLines) == 0 || m.app.DetailMode == "logs" || m.app.DetailMode == "stats" || m.app.DetailMode == "top" || m.app.DetailMode == "events" || m.app.DetailMode == "system" {
+		if len(m.app.DetailLines) == 0 || m.app.DetailMode == "logs" || m.app.DetailMode == "stats" || m.app.DetailMode == "top" || m.app.DetailMode == "events" || m.app.DetailMode == "system" || m.app.DetailMode == "history" {
 			detailCommand = m.detailCmd()
 		}
 		return m, tea.Batch(detailCommand, m.refreshCmd())
@@ -392,8 +392,6 @@ func (m Model) executeMenuAction() tea.Cmd {
 	case "exec", "copy_to", "copy_from", "pull", "run", "build", "push", "image_tag", "image_search", "image_save", "image_load", "image_import", "registry_login", "registry_logout", "create_pod", "create_volume", "create_network", "create_secret", "network_connect", "network_disconnect", "prune_images", "prune_pods", "prune_volumes", "prune_networks", "system_prune":
 		m.app.beginPrompt(action)
 		return nil
-	case "image_history":
-		return m.imageOutputCommand("history")
 	case "image_untag":
 		return m.requestAction("image_untag")
 	case "volume_mount", "volume_unmount":
@@ -446,19 +444,6 @@ func (m Model) actionCmd(action string) tea.Cmd {
 			err = &PodmanError{Message: "Action \"" + action + "\" is not available for " + itemCopy.Kind + "."}
 		}
 		return bubbleActionMsg{action: action, itemID: itemCopy.ID, name: itemCopy.Name, err: err}
-	}
-}
-
-func (m Model) imageOutputCommand(action string) tea.Cmd {
-	item := m.app.current()
-	if item == nil || item.Kind != "image" {
-		return nil
-	}
-	client := m.app.Client
-	itemCopy := *item
-	return func() tea.Msg {
-		value, err := client.imageHistory(itemCopy.ID)
-		return bubbleActionMsg{action: "image_" + action, itemID: itemCopy.ID, name: itemCopy.Name, output: valueText(value), err: err}
 	}
 }
 

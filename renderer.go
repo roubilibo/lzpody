@@ -271,6 +271,11 @@ func (a *App) frame(width, height int) string {
 		if item != nil {
 			title = item.Name
 		}
+		if a.DetailMode == "stats" && item != nil {
+			if history := a.StatsHistory[item.ID]; len(history) > 0 {
+				a.DetailRawLines = statsLinesForWidth(history, rightWidth-4)
+			}
+		}
 		position := ""
 		if len(a.DetailLines) > 0 {
 			first := a.DetailScroll + 1
@@ -296,8 +301,48 @@ func (a *App) frame(width, height int) string {
 		a.DetailViewRows = max(1, detailRows)
 		a.reflowDetail(rightWidth - 4)
 		start := max(0, min(a.DetailScroll, max(0, len(a.DetailLines)-detailRows)))
+		statsGraphNumbers := make([]int, len(a.DetailLines))
+		if a.DetailMode == "stats" {
+			cpuCaption, memoryCaption := -1, -1
+			for lineIndex, line := range a.DetailLines {
+				if strings.Contains(line, "CPU (%)") {
+					cpuCaption = lineIndex
+				}
+				if strings.Contains(line, "Memory (%)") {
+					memoryCaption = lineIndex
+				}
+			}
+			for lineIndex := range a.DetailLines {
+				if cpuCaption >= 2 && lineIndex >= 2 && lineIndex <= cpuCaption {
+					statsGraphNumbers[lineIndex] = 1
+				} else if memoryCaption > cpuCaption && lineIndex > cpuCaption && lineIndex <= memoryCaption {
+					statsGraphNumbers[lineIndex] = 2
+				}
+			}
+		}
+		cpuGraphStyle := uiTheme.GraphCPU
+		memoryGraphStyle := uiTheme.GraphMemory
 		for index, line := range a.DetailLines[start:min(start+detailRows, len(a.DetailLines))] {
-			putLine(lines, top+2+index, rightX+2, rightWidth-4, line)
+			row := top + 2 + index
+			putLine(lines, row, rightX+2, rightWidth-4, line)
+			lineStyle := uiTheme.Normal
+			if a.DetailMode == "stats" {
+				graphNumber := statsGraphNumbers[start+index]
+				if graphNumber == 1 {
+					lineStyle = cpuGraphStyle
+				} else if graphNumber == 2 {
+					lineStyle = memoryGraphStyle
+				} else if line == "Resource statistics" {
+					lineStyle = uiTheme.Title
+				}
+				if strings.Contains(line, "CPU (%)") {
+					lineStyle = cpuGraphStyle.Bold(true)
+				}
+				if strings.Contains(line, "Memory (%)") {
+					lineStyle = memoryGraphStyle.Bold(true)
+				}
+			}
+			addTextRegion(regions, row, rightX+2, rightWidth-4, line, lineStyle)
 		}
 	}
 	putLine(lines, height-2, 1, width-2, a.Status)

@@ -24,6 +24,7 @@ type UITheme struct {
 	Name                                             string
 	Normal, Title, Selected, Muted, Running, Stopped lipgloss.Style
 	Error, Border, Key, KeySelected                  lipgloss.Style
+	GraphCPU, GraphMemory                            lipgloss.Style
 }
 
 func colorStyle(foreground, background string, bold bool) lipgloss.Style {
@@ -97,5 +98,9 @@ func loadUITheme() UITheme {
 		Border:      colorStyle(colors["muted"], "", false),
 		Key:         colorStyle(colors["yellow"], "", true),
 		KeySelected: colorStyle(colors["yellow"], colors["selection"], true),
+		// Use Akane's primary accent colors for graphs so they belong to the
+		// same visual hierarchy as panel borders, titles, and key hints.
+		GraphCPU:    colorStyle(colors["accent"], "", false),
+		GraphMemory: colorStyle(colors["yellow"], "", false),
 	}
 }

@@ -294,6 +294,18 @@ func fetchDetail(client *PodmanClient, item Item, mode string, history []map[str
 		encoded, _ := json.MarshalIndent(value, "", "  ")
 		result.lines = strings.Split(string(encoded), "\n")
 		result.status = strings.Title(mode) + ": " + item.Name
+	case "history":
+		if item.Kind != "image" {
+			return result
+		}
+		value, err := client.imageHistory(item.ID)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		encoded, _ := json.MarshalIndent(value, "", "  ")
+		result.lines = strings.Split(string(encoded), "\n")
+		result.status = "History: " + item.Name
 	case "relationships":
 		value, err := inspectItem(client, item)
 		if err != nil {
@@ -424,20 +436,34 @@ func (a *App) reflowDetail(width int) {
 	if width > 0 {
 		a.DetailViewWidth = width
 	}
-	if a.DetailMode != "logs" || a.DetailRawLines == nil {
+	if a.DetailRawLines == nil {
 		return
 	}
 	lines := append([]string(nil), a.DetailRawLines...)
-	if a.DetailViewWidth > 0 {
+	if a.DetailMode == "logs" && a.DetailViewWidth > 0 {
 		lines = wrapLines(lines, a.DetailViewWidth)
 	}
-	a.DetailLines = append(lines, make([]string, logsBottomSpacer)...)
+	if a.detailNeedsBottomSpacer() {
+		lines = append(lines, make([]string, logsBottomSpacer)...)
+	}
+	a.DetailLines = lines
 	maximum := max(0, len(a.DetailLines)-max(1, a.DetailViewRows))
-	if a.LogsFollow {
+	if a.DetailMode == "logs" && a.LogsFollow {
 		a.DetailScroll = maximum
 	} else {
 		a.DetailScroll = min(a.DetailScroll, maximum)
 	}
+}
+
+func (a *App) detailNeedsBottomSpacer() bool {
+	if a.DetailMode == "logs" || a.DetailMode == "system" {
+		return true
+	}
+	if a.DetailMode == "config" {
+		item := a.current()
+		return item != nil && item.Kind == "container"
+	}
+	return false
 }
 
 func wrapLines(lines []string, width int) []string {
@@ -496,15 +522,24 @@ func isLogTimestamp(line string) bool {
 }
 
 func (a *App) detailTabs() []string {
-	if a.DetailMode == "system" || a.DetailMode == "events" || a.DetailMode == "exec" || a.DetailMode == "shell" || a.DetailMode == "pull" || a.DetailMode == "relationships" || a.DetailMode == "create" {
+	if a.DetailMode == "system" || a.DetailMode == "events" || a.DetailMode == "exec" || a.DetailMode == "shell" || a.DetailMode == "pull" || a.DetailMode == "create" {
 		return []string{a.DetailMode}
 	}
 	item := a.current()
 	if item != nil && item.Kind == "container" {
-		return []string{"summary", "logs", "stats", "env", "config", "top"}
+		return []string{"summary", "logs", "stats", "env", "config", "relationships", "top"}
 	}
 	if item != nil && item.Kind == "pod" {
-		return []string{"summary", "stats", "config"}
+		return []string{"summary", "stats", "relationships", "config"}
+	}
+	if item != nil && item.Kind == "image" {
+		return []string{"summary", "history", "config"}
+	}
+	if item != nil && item.Kind == "network" {
+		return []string{"summary", "relationships", "config"}
+	}
+	if item != nil && item.Kind == "volume" {
+		return []string{"summary", "relationships", "config"}
 	}
 	return []string{"summary", "config"}
 }
@@ -555,45 +590,60 @@ func (a *App) toggleMode(mode string) {
 func (a *App) menuEntries() [][2]string {
 	item := a.current()
 	if item == nil {
-		return append([][2]string{{"Refresh", "refresh"}}, globalActions()...)
+		return append(actionsForMode(a.Mode), panelUtilityActions()...)
 	}
 	if item.Kind == "container" {
 		pause, label := "pause", "Pause"
 		if strings.ToLower(item.State) == "paused" {
 			pause, label = "unpause", "Unpause"
 		}
-		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {label + " [p]", pause}, {"Kill [K]", "kill"}, {"Logs [m]", "logs"}, {"Attach [a]", "attach"}, {"Stats [t]", "stats"}, {"Environment", "env"}, {"Config [i]", "config"}, {"Relationships", "relationships"}, {"Top", "top"}, {"Exec shell [E]", "shell"}, {"Exec command", "exec"}, {"Copy to container", "copy_to"}, {"Copy from container", "copy_from"}, {"Hide stopped [e]", "hide_stopped"}, {"Remove [d]", "remove"}}
-		return append(entries, globalActions()...)
+		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {label + " [p]", pause}, {"Kill [K]", "kill"}, {"Logs [m]", "logs"}, {"Attach [a]", "attach"}, {"Stats [t]", "stats"}, {"Environment", "env"}, {"Config [i]", "config"}, {"Relationships", "relationships"}, {"Top", "top"}, {"Exec shell [E]", "shell"}, {"Exec command", "exec"}, {"Copy to container", "copy_to"}, {"Copy from container", "copy_from"}, {"Hide stopped [e]", "hide_stopped"}, {"Remove [d]", "remove"}, {"Create container [C]", "run"}}
+		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "pod" {
-		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {"Pause [p]", "pause"}, {"Unpause [p]", "unpause"}, {"Kill [K]", "kill"}, {"Stats [t]", "stats"}, {"Config [i]", "config"}, {"Relationships", "relationships"}, {"Remove [d]", "remove"}}
-		return append(entries, globalActionsForResources()...)
+		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {"Pause [p]", "pause"}, {"Unpause [p]", "unpause"}, {"Kill [K]", "kill"}, {"Stats [t]", "stats"}, {"Config [i]", "config"}, {"Relationships", "relationships"}, {"Remove [d]", "remove"}, {"Create pod", "create_pod"}}
+		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "network" {
-		entries := [][2]string{{"Config [i]", "config"}, {"Relationships", "relationships"}, {"Connect container", "network_connect"}, {"Disconnect container", "network_disconnect"}, {"Remove [d]", "remove"}}
-		return append(entries, globalActionsForResources()...)
+		entries := [][2]string{{"Config [i]", "config"}, {"Connect container", "network_connect"}, {"Disconnect container", "network_disconnect"}, {"Remove [d]", "remove"}, {"Create network", "create_network"}}
+		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "volume" {
-		entries := [][2]string{{"Config [i]", "config"}, {"Relationships", "relationships"}, {"Mount volume", "volume_mount"}, {"Unmount volume", "volume_unmount"}, {"Remove [d]", "remove"}}
-		return append(entries, globalActionsForResources()...)
+		entries := [][2]string{{"Config [i]", "config"}, {"Relationships", "relationships"}, {"Mount volume", "volume_mount"}, {"Unmount volume", "volume_unmount"}, {"Remove [d]", "remove"}, {"Create volume", "create_volume"}}
+		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "secret" {
-		entries := [][2]string{{"Config [i]", "config"}, {"Remove [d]", "remove"}}
-		return append(entries, globalActionsForResources()...)
+		entries := [][2]string{{"Config [i]", "config"}, {"Remove [d]", "remove"}, {"Create secret", "create_secret"}}
+		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "image" {
-		entries := [][2]string{{"Config [i]", "config"}, {"History", "image_history"}, {"Tag image", "image_tag"}, {"Untag image", "image_untag"}, {"Save image", "image_save"}, {"Search registry", "image_search"}, {"Remove [d]", "remove"}}
-		return append(entries, globalActions()...)
+		entries := [][2]string{{"Config [i]", "config"}, {"Tag image", "image_tag"}, {"Untag image", "image_untag"}, {"Save image", "image_save"}, {"Search registry", "image_search"}, {"Pull image [P]", "pull"}, {"Build image [B]", "build"}, {"Push image [U]", "push"}, {"Load image", "image_load"}, {"Import image", "image_import"}, {"Registry login", "registry_login"}, {"Registry logout", "registry_logout"}, {"Prune images", "prune_images"}, {"Remove [d]", "remove"}}
+		return append(entries, panelUtilityActions()...)
 	}
-	return append([][2]string{{"Config [i]", "config"}, {"Remove [d]", "remove"}}, globalActions()...)
+	return append([][2]string{{"Config [i]", "config"}, {"Remove [d]", "remove"}}, panelUtilityActions()...)
 }
 
-func globalActions() [][2]string {
-	return [][2]string{{"Pull image [P]", "pull"}, {"Build image [B]", "build"}, {"Push image [U]", "push"}, {"Load image", "image_load"}, {"Import image", "image_import"}, {"Registry login", "registry_login"}, {"Registry logout", "registry_logout"}, {"Prune images", "prune_images"}, {"Prune pods", "prune_pods"}, {"Prune volumes", "prune_volumes"}, {"Prune networks", "prune_networks"}, {"System prune", "system_prune"}, {"Create container [C]", "run"}, {"Create pod", "create_pod"}, {"Create volume", "create_volume"}, {"Create network", "create_network"}, {"Create secret", "create_secret"}, {"System info", "system_info"}, {"Events", "events"}}
+func actionsForMode(mode string) [][2]string {
+	switch mode {
+	case "containers":
+		return [][2]string{{"Create container [C]", "run"}}
+	case "pods":
+		return [][2]string{{"Create pod", "create_pod"}}
+	case "images":
+		return [][2]string{{"Pull image [P]", "pull"}, {"Build image [B]", "build"}, {"Push image [U]", "push"}, {"Load image", "image_load"}, {"Import image", "image_import"}, {"Registry login", "registry_login"}, {"Registry logout", "registry_logout"}, {"Search registry", "image_search"}, {"Prune images", "prune_images"}}
+	case "volumes":
+		return [][2]string{{"Create volume", "create_volume"}, {"Prune volumes", "prune_volumes"}}
+	case "networks":
+		return [][2]string{{"Create network", "create_network"}, {"Prune networks", "prune_networks"}}
+	case "secrets":
+		return [][2]string{{"Create secret", "create_secret"}}
+	default:
+		return nil
+	}
 }
 
-func globalActionsForResources() [][2]string {
-	return globalActions()
+func panelUtilityActions() [][2]string {
+	return [][2]string{{"Refresh", "refresh"}, {"System info", "system_info"}, {"Events", "events"}, {"System prune", "system_prune"}}
 }
 
 func (a *App) openMenu() {

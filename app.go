@@ -24,11 +24,16 @@ type App struct {
 	Mode            string
 	Items           map[string][]Item
 	Selected        map[string]int
+	Marked          map[string]map[string]bool
 	DetailMode      string
 	DetailLines     []string
 	DetailRawLines  []string
 	StatsHistory    map[string][]map[string]any
+	StatsStream     *statsStreamSession
+	EventStream     *eventStreamSession
+	EventFilter     string
 	Filter          string
+	LogFilter       string
 	HideStopped     bool
 	Status          string
 	LastRefresh     time.Time
@@ -40,6 +45,8 @@ type App struct {
 	FocusMain       bool
 	MenuOpen        bool
 	MenuIndex       int
+	MenuFilter      string
+	PaletteInput    bool
 	Dirty           bool
 	ConfirmAction   string
 	FilterInput     bool
@@ -50,6 +57,11 @@ type App struct {
 	Shell           *shellSession
 	Pull            *pullSession
 	PullOverlay     bool
+	Operation       *operationSession
+	Capabilities    PodmanCapabilities
+	CapabilitiesSet bool
+	Config          UserConfig
+	RefreshAfter    time.Duration
 }
 
 type resourceSnapshot struct {
@@ -98,11 +110,14 @@ type containerFormState struct {
 
 func NewApp(client *PodmanClient) *App {
 	items, selected := map[string][]Item{}, map[string]int{}
+	marked := map[string]map[string]bool{}
 	for _, mode := range resourceModes {
 		items[mode] = []Item{}
 		selected[mode] = 0
+		marked[mode] = map[string]bool{}
 	}
-	return &App{Client: client, Mode: "containers", Items: items, Selected: selected, DetailMode: "summary", StatsHistory: map[string][]map[string]any{}, LogsFollow: true, Status: "Connecting to rootless Podman...", Dirty: true}
+	config, _ := loadUserConfig()
+	return &App{Client: client, Mode: "containers", Items: items, Selected: selected, Marked: marked, DetailMode: "summary", StatsHistory: map[string][]map[string]any{}, LogsFollow: true, Status: "Connecting to rootless Podman...", Dirty: true, Config: config, RefreshAfter: config.refreshDuration()}
 }
 
 func (a *App) current() *Item {
@@ -112,6 +127,40 @@ func (a *App) current() *Item {
 		return nil
 	}
 	return &items[index]
+}
+
+func (a *App) toggleMarked() {
+	item := a.current()
+	if item == nil || (item.Kind != "container" && item.Kind != "pod") {
+		a.Status = "Only containers and pods can be batch-selected."
+		return
+	}
+	if a.Marked[a.Mode] == nil {
+		a.Marked[a.Mode] = map[string]bool{}
+	}
+	if a.Marked[a.Mode][item.ID] {
+		delete(a.Marked[a.Mode], item.ID)
+	} else {
+		a.Marked[a.Mode][item.ID] = true
+	}
+	a.Status = fmt.Sprintf("Selected %d %s.", len(a.Marked[a.Mode]), a.Mode)
+	a.Dirty = true
+}
+
+func (a *App) markedItems() []Item {
+	marked := a.Marked[a.Mode]
+	items := make([]Item, 0, len(marked))
+	for _, item := range a.Items[a.Mode] {
+		if marked[item.ID] {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (a *App) clearMarked() {
+	a.Marked[a.Mode] = map[string]bool{}
+	a.Dirty = true
 }
 
 func fetchResourceSnapshot(client *PodmanClient, filter string, hideStopped bool) resourceSnapshot {
@@ -177,13 +226,13 @@ func (a *App) applyRefresh(result resourceSnapshot, keepID string) {
 		}
 	}
 	a.LastRefresh = result.lastRefresh
-	if result.hasError || (a.DetailMode != "logs" && a.DetailMode != "stats" && a.DetailMode != "top" && a.DetailMode != "system" && a.DetailMode != "events" && a.DetailMode != "exec" && a.DetailMode != "shell" && a.DetailMode != "pull" && a.DetailMode != "relationships") {
+	if a.Operation == nil && (result.hasError || (a.DetailMode != "logs" && a.DetailMode != "stats" && a.DetailMode != "top" && a.DetailMode != "system" && a.DetailMode != "storage" && a.DetailMode != "help" && a.DetailMode != "events" && a.DetailMode != "exec" && a.DetailMode != "shell" && a.DetailMode != "pull" && a.DetailMode != "relationships")) {
 		a.Status = result.status
 	}
 	a.Dirty = true
 }
 
-func fetchDetail(client *PodmanClient, item Item, mode string, history []map[string]any) detailResult {
+func fetchDetail(client *PodmanClient, item Item, mode string, history []map[string]any, logFilter string) detailResult {
 	result := detailResult{itemID: item.ID, mode: mode}
 	switch mode {
 	case "system":
@@ -195,6 +244,28 @@ func fetchDetail(client *PodmanClient, item Item, mode string, history []map[str
 		encoded, _ := json.MarshalIndent(value, "", "  ")
 		result.lines = strings.Split(string(encoded), "\n")
 		result.status = "System information"
+	case "help":
+		result.lines = []string{
+			"lzpody help",
+			"",
+			"Navigation:  h/l or ←/→ panels · j/k or ↑/↓ items · Enter focus detail",
+			"Detail:      [/] tabs · PgUp/PgDn scroll · Home/End jump",
+			"Actions:     x or ? menu · / filter/search · F5 refresh · q quit",
+			"Container:   S start · s stop · r restart · p pause · m logs · t stats",
+			"Safety:      destructive operations ask for confirmation before execution",
+			"",
+			"Use Settings from the action menu to persist socket, refresh, theme, and log preferences.",
+		}
+		result.status = "Help"
+	case "storage":
+		value, err := client.systemDf()
+		if err != nil {
+			result.err = err
+			return result
+		}
+		encoded, _ := json.MarshalIndent(value, "", "  ")
+		result.lines = strings.Split(string(encoded), "\n")
+		result.status = "Storage usage"
 	case "events":
 		value, err := client.events(time.Now().Add(-10 * time.Second))
 		if err != nil {
@@ -235,8 +306,24 @@ func fetchDetail(client *PodmanClient, item Item, mode string, history []map[str
 			result.err = err
 			return result
 		}
-		result.lines = markLogTimestamps(splitLines(value, "(no logs)"))
+		result.lines = filterLogLines(markLogTimestamps(splitLines(value, "(no logs)")), logFilter)
 		result.status = "Logs: " + item.Name
+		if strings.TrimSpace(logFilter) != "" {
+			result.status += " · filter: " + strings.TrimSpace(logFilter)
+		}
+	case "ports":
+		if item.Kind != "container" {
+			return result
+		}
+		result.lines = append(result.lines, "Port mappings for "+item.Name)
+		if len(item.Ports) == 0 {
+			result.lines = append(result.lines, "", "(no port mappings)")
+		} else {
+			for _, port := range item.Ports {
+				result.lines = append(result.lines, "", port)
+			}
+		}
+		result.status = "Ports: " + item.Name
 	case "stats":
 		if item.Kind != "container" && item.Kind != "pod" {
 			return result
@@ -354,6 +441,23 @@ func fetchDetail(client *PodmanClient, item Item, mode string, history []map[str
 	return result
 }
 
+func filterLogLines(lines []string, filter string) []string {
+	needle := strings.ToLower(strings.TrimSpace(filter))
+	if needle == "" {
+		return lines
+	}
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), needle) {
+			filtered = append(filtered, line)
+		}
+	}
+	if len(filtered) == 0 {
+		return []string{"(no log lines match \"" + strings.TrimSpace(filter) + "\")"}
+	}
+	return filtered
+}
+
 func inspectItem(client *PodmanClient, item Item) (any, error) {
 	return client.inspect(item.Kind+"s", item.ID)
 }
@@ -399,7 +503,7 @@ func relationshipLines(kind string, value any) []string {
 
 func (a *App) applyDetail(result detailResult) {
 	item := a.current()
-	globalDetail := result.mode == "system" || result.mode == "events"
+	globalDetail := result.mode == "system" || result.mode == "storage" || result.mode == "help" || result.mode == "events"
 	if (!globalDetail && (item == nil || item.ID != result.itemID)) || a.DetailMode != result.mode || (result.requestID != 0 && result.requestID != a.DetailRequestID) {
 		return
 	}
@@ -522,12 +626,12 @@ func isLogTimestamp(line string) bool {
 }
 
 func (a *App) detailTabs() []string {
-	if a.DetailMode == "system" || a.DetailMode == "events" || a.DetailMode == "exec" || a.DetailMode == "shell" || a.DetailMode == "pull" || a.DetailMode == "create" {
+	if a.DetailMode == "system" || a.DetailMode == "storage" || a.DetailMode == "help" || a.DetailMode == "events" || a.DetailMode == "exec" || a.DetailMode == "shell" || a.DetailMode == "pull" || a.DetailMode == "create" {
 		return []string{a.DetailMode}
 	}
 	item := a.current()
 	if item != nil && item.Kind == "container" {
-		return []string{"summary", "logs", "stats", "env", "config", "relationships", "top"}
+		return []string{"summary", "logs", "stats", "ports", "env", "config", "relationships", "top"}
 	}
 	if item != nil && item.Kind == "pod" {
 		return []string{"summary", "stats", "relationships", "config"}
@@ -553,6 +657,9 @@ func (a *App) cycleTab(delta int) {
 		}
 	}
 	next := tabs[(index+delta+len(tabs))%len(tabs)]
+	if a.DetailMode == "stats" && next != "stats" {
+		a.stopLiveStreams()
+	}
 	a.DetailMode = next
 	if next == "logs" {
 		a.LogsFollow = true
@@ -560,6 +667,7 @@ func (a *App) cycleTab(delta int) {
 }
 
 func (a *App) move(delta int) {
+	a.stopLiveStreams()
 	items := a.Items[a.Mode]
 	if len(items) == 0 {
 		return
@@ -568,6 +676,7 @@ func (a *App) move(delta int) {
 	a.DetailMode = "summary"
 }
 func (a *App) moveFocus(delta int) {
+	a.stopLiveStreams()
 	index := 0
 	for i, mode := range resourceModes {
 		if mode == a.Mode {
@@ -578,6 +687,7 @@ func (a *App) moveFocus(delta int) {
 	a.DetailMode = "summary"
 }
 func (a *App) toggleMode(mode string) {
+	a.stopLiveStreams()
 	if a.Mode == mode {
 		a.FocusMain = false
 		return
@@ -597,11 +707,11 @@ func (a *App) menuEntries() [][2]string {
 		if strings.ToLower(item.State) == "paused" {
 			pause, label = "unpause", "Unpause"
 		}
-		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {label + " [p]", pause}, {"Kill [K]", "kill"}, {"Logs [m]", "logs"}, {"Attach [a]", "attach"}, {"Stats [t]", "stats"}, {"Environment", "env"}, {"Config [i]", "config"}, {"Relationships", "relationships"}, {"Top", "top"}, {"Exec shell [E]", "shell"}, {"Exec command", "exec"}, {"Copy to container", "copy_to"}, {"Copy from container", "copy_from"}, {"Hide stopped [e]", "hide_stopped"}, {"Remove [d]", "remove"}, {"Create container [C]", "run"}}
+		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {label + " [p]", pause}, {"Kill [K]", "kill"}, {"Init filesystem", "init"}, {"Wait for condition", "wait"}, {"Rename", "rename"}, {"Logs [m]", "logs"}, {"Attach [a]", "attach"}, {"Stats [t]", "stats"}, {"Ports", "ports"}, {"Healthcheck", "healthcheck"}, {"Filesystem changes", "diff"}, {"Mount rootfs", "mount"}, {"Unmount rootfs", "unmount"}, {"Export filesystem", "export"}, {"Checkpoint", "checkpoint"}, {"Restore checkpoint", "restore"}, {"Commit image", "commit"}, {"Generate Kubernetes YAML", "kube_generate"}, {"Generate systemd unit", "systemd"}, {"Quadlet file", "quadlet"}, {"Environment", "env"}, {"Config [i]", "config"}, {"Relationships", "relationships"}, {"Top", "top"}, {"Exec shell [E]", "shell"}, {"Exec command", "exec"}, {"Copy to container", "copy_to"}, {"Copy from container", "copy_from"}, {"Hide stopped [e]", "hide_stopped"}, {"Remove [d]", "remove"}, {"Create container [C]", "run"}}
 		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "pod" {
-		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {"Pause [p]", "pause"}, {"Unpause [p]", "unpause"}, {"Kill [K]", "kill"}, {"Stats [t]", "stats"}, {"Config [i]", "config"}, {"Relationships", "relationships"}, {"Remove [d]", "remove"}, {"Create pod", "create_pod"}}
+		entries := [][2]string{{"Start [S]", "start"}, {"Stop [s]", "stop"}, {"Restart [r]", "restart"}, {"Pause [p]", "pause"}, {"Unpause [p]", "unpause"}, {"Kill [K]", "kill"}, {"Stats [t]", "stats"}, {"Inspect [i]", "config"}, {"Generate Kubernetes YAML", "kube_generate"}, {"Generate systemd unit", "systemd"}, {"Quadlet file", "quadlet"}, {"Relationships", "relationships"}, {"Remove [d]", "remove"}, {"Create pod", "create_pod"}, {"Prune unused pods", "prune_pods"}}
 		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "network" {
@@ -617,7 +727,7 @@ func (a *App) menuEntries() [][2]string {
 		return append(entries, panelUtilityActions()...)
 	}
 	if item.Kind == "image" {
-		entries := [][2]string{{"Config [i]", "config"}, {"Tag image", "image_tag"}, {"Untag image", "image_untag"}, {"Save image", "image_save"}, {"Search registry", "image_search"}, {"Pull image [P]", "pull"}, {"Build image [B]", "build"}, {"Push image [U]", "push"}, {"Load image", "image_load"}, {"Import image", "image_import"}, {"Registry login", "registry_login"}, {"Registry logout", "registry_logout"}, {"Prune images", "prune_images"}, {"Remove [d]", "remove"}}
+		entries := [][2]string{{"Config [i]", "config"}, {"Manifest inspect", "manifest_inspect"}, {"Tag image", "image_tag"}, {"Untag image", "image_untag"}, {"Save image", "image_save"}, {"Search registry", "image_search"}, {"Pull image [P]", "pull"}, {"Build image [B]", "build"}, {"Push image [U]", "push"}, {"Load image", "image_load"}, {"Import image", "image_import"}, {"Create manifest", "manifest_create"}, {"Add to manifest", "manifest_add"}, {"Push manifest", "manifest_push"}, {"Registry login", "registry_login"}, {"Registry logout", "registry_logout"}, {"Prune images", "prune_images"}, {"Remove [d]", "remove"}}
 		return append(entries, panelUtilityActions()...)
 	}
 	return append([][2]string{{"Config [i]", "config"}, {"Remove [d]", "remove"}}, panelUtilityActions()...)
@@ -628,7 +738,7 @@ func actionsForMode(mode string) [][2]string {
 	case "containers":
 		return [][2]string{{"Create container [C]", "run"}}
 	case "pods":
-		return [][2]string{{"Create pod", "create_pod"}}
+		return [][2]string{{"Create pod", "create_pod"}, {"Prune unused pods", "prune_pods"}}
 	case "images":
 		return [][2]string{{"Pull image [P]", "pull"}, {"Build image [B]", "build"}, {"Push image [U]", "push"}, {"Load image", "image_load"}, {"Import image", "image_import"}, {"Registry login", "registry_login"}, {"Registry logout", "registry_logout"}, {"Search registry", "image_search"}, {"Prune images", "prune_images"}}
 	case "volumes":
@@ -643,20 +753,39 @@ func actionsForMode(mode string) [][2]string {
 }
 
 func panelUtilityActions() [][2]string {
-	return [][2]string{{"Refresh", "refresh"}, {"System info", "system_info"}, {"Events", "events"}, {"System prune", "system_prune"}}
+	return [][2]string{{"Refresh", "refresh"}, {"Batch start", "batch_start"}, {"Batch stop", "batch_stop"}, {"Batch remove", "batch_remove"}, {"System info", "system_info"}, {"Storage usage", "system_df"}, {"Storage check", "system_check"}, {"Kube play", "kube_play"}, {"Kube down", "kube_down"}, {"Help", "help"}, {"Settings", "settings"}, {"Events", "events"}, {"System prune", "system_prune"}}
 }
 
 func (a *App) openMenu() {
 	a.MenuOpen = true
 	a.MenuIndex = 0
+	a.MenuFilter = ""
+	a.PaletteInput = false
 }
 
 func (a *App) closeMenu() {
 	a.MenuOpen = false
+	a.MenuFilter = ""
+	a.PaletteInput = false
+}
+
+func (a *App) visibleMenuEntries() [][2]string {
+	entries := a.menuEntries()
+	needle := strings.ToLower(strings.TrimSpace(a.MenuFilter))
+	if needle == "" {
+		return entries
+	}
+	filtered := make([][2]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.Contains(strings.ToLower(entry[0]+" "+entry[1]), needle) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 func (a *App) moveMenu(delta int) {
-	entries := a.menuEntries()
+	entries := a.visibleMenuEntries()
 	if len(entries) == 0 {
 		return
 	}
@@ -664,7 +793,7 @@ func (a *App) moveMenu(delta int) {
 }
 
 func (a *App) selectedMenuAction() string {
-	entries := a.menuEntries()
+	entries := a.visibleMenuEntries()
 	if a.MenuIndex < 0 || a.MenuIndex >= len(entries) {
 		return ""
 	}

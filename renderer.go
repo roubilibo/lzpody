@@ -144,7 +144,7 @@ func menuEntryText(entry [2]string, width int) string {
 }
 
 func (a *App) frame(width, height int) string {
-	uiTheme := loadUITheme()
+	uiTheme := loadUITheme(a.Config.Theme)
 	lines := make([]string, height)
 	styles := make([]lipgloss.Style, height)
 	regions := make([][]textRegion, height)
@@ -158,6 +158,9 @@ func (a *App) frame(width, height int) string {
 	}
 	headerTitle := " lzpody "
 	headerSubtitle := "native Libpod · " + uiTheme.Name
+	if a.CapabilitiesSet && a.Capabilities.LibpodVersion != "" {
+		headerSubtitle = "native Libpod " + a.Capabilities.LibpodVersion + " · " + uiTheme.Name
+	}
 	putLine(lines, 0, 0, width, headerTitle)
 	putLine(lines, 0, 14, width-14, headerSubtitle)
 	addTextRegion(regions, 0, 0, width, headerTitle, uiTheme.Title)
@@ -208,6 +211,9 @@ func (a *App) frame(width, height int) string {
 		start := max(0, min(selected-visible+1, len(a.Items[mode])-visible))
 		for row, item := range a.Items[mode][start:min(start+visible, len(a.Items[mode]))] {
 			marker := "○"
+			if a.Marked[mode][item.ID] {
+				marker = "✓"
+			}
 			if item.Kind == "image" {
 				marker = "◆"
 			} else if item.Kind == "volume" || item.Kind == "network" {
@@ -363,11 +369,21 @@ func (a *App) frame(width, height int) string {
 		if a.Pull.done {
 			footer = "pull finished  press any key to close"
 		} else {
-			footer = "pulling image in background"
+			footer = "pulling image  Esc cancel"
+		}
+	}
+	if a.Operation != nil {
+		if a.Operation.done {
+			footer = strings.ToLower(a.Operation.title) + " finished  press any key to close"
+		} else {
+			footer = strings.ToLower(a.Operation.title) + " in progress  Esc cancel"
 		}
 	}
 	if a.MenuOpen {
-		footer = "↑/↓ j/k select  Enter/Space choose  Esc/q close menu"
+		footer = "↑/↓ j/k select  Enter/Space choose  / search  Esc/q close menu"
+		if a.PaletteInput {
+			footer = "type action search  Enter apply  Esc cancel"
+		}
 	}
 	if a.ContainerForm != nil {
 		footer = "Tab/Enter next  [ / ] tabs  Ctrl+S create  Esc cancel"
@@ -375,7 +391,7 @@ func (a *App) frame(width, height int) string {
 	putLine(lines, height-1, 1, width-2, footer)
 	addTextRegion(regions, height-1, 1, width-2, footer, uiTheme.Key)
 	if a.MenuOpen {
-		entries := a.menuEntries()
+		entries := a.visibleMenuEntries()
 		boxWidth := min(42, max(24, width-6))
 		boxHeight := min(len(entries)+2, max(5, height-4))
 		menuTop := max(1, (height-boxHeight)/2)
@@ -389,7 +405,11 @@ func (a *App) frame(width, height int) string {
 		}
 		putLine(lines, menuTop+boxHeight-1, menuLeft, boxWidth, boxLine(boxWidth, '└', '┘'))
 		addRegion(regions, menuTop+boxHeight-1, menuLeft, menuLeft+boxWidth, menuStyle)
-		putLine(lines, menuTop, menuLeft+2, boxWidth-4, "Actions")
+		menuTitle := "Actions"
+		if a.MenuFilter != "" {
+			menuTitle += " · " + a.MenuFilter
+		}
+		putLine(lines, menuTop, menuLeft+2, boxWidth-4, menuTitle)
 		visible := max(1, boxHeight-2)
 		start := max(0, min(a.MenuIndex-visible+1, len(entries)-visible))
 		for index, entry := range entries[start:min(start+visible, len(entries))] {
@@ -403,9 +423,18 @@ func (a *App) frame(width, height int) string {
 		}
 	}
 	if a.FilterInput {
-		filterText := "Filter: " + a.FilterDraft
+		label := "Filter: "
+		if a.DetailMode == "logs" && a.FocusMain {
+			label = "Log search: "
+		}
+		filterText := label + a.FilterDraft
 		putLine(lines, height-2, 1, width-2, filterText)
 		addTextRegion(regions, height-2, 1, width-2, filterText, uiTheme.Normal.Bold(true))
+	}
+	if a.PaletteInput {
+		paletteText := "Action search: " + a.FilterDraft
+		putLine(lines, height-2, 1, width-2, paletteText)
+		addTextRegion(regions, height-2, 1, width-2, paletteText, uiTheme.Normal.Bold(true))
 	}
 	if a.ConfirmAction != "" {
 		drawConfirmOverlay(lines, styles, regions, width, height, uiTheme, a)
@@ -415,6 +444,9 @@ func (a *App) frame(width, height int) string {
 	}
 	if a.Pull != nil && a.PullOverlay {
 		drawPullOverlay(lines, regions, width, height, uiTheme, a.Pull)
+	}
+	if a.Operation != nil {
+		drawOperationOverlay(lines, regions, width, height, uiTheme, a.Operation)
 	}
 	return frameText(lines, styles, regions)
 }
@@ -524,7 +556,53 @@ func drawPullOverlay(lines []string, regions [][]textRegion, width, height int, 
 		putLine(lines, top+2+index, left, boxWidth, "│"+text+"│")
 		addTextRegion(regions, top+2+index, left+1, boxWidth-2, text, theme.Selected)
 	}
-	hint := centeredLine("Press any key to close", boxWidth-2)
+	hintText := "Esc cancel"
+	if pull.done {
+		hintText = "Press any key to close"
+	}
+	hint := centeredLine(hintText, boxWidth-2)
+	putLine(lines, top+boxHeight-2, left, boxWidth, "│"+hint+"│")
+	addTextRegion(regions, top+boxHeight-2, left+1, boxWidth-2, hint, theme.KeySelected)
+}
+
+func drawOperationOverlay(lines []string, regions [][]textRegion, width, height int, theme UITheme, operation *operationSession) {
+	if operation == nil {
+		return
+	}
+	longest := len([]rune("Esc cancel"))
+	for _, line := range operation.lines {
+		longest = max(longest, len([]rune(line)))
+	}
+	boxWidth := min(max(48, longest+4), max(48, width-6))
+	visible := min(max(3, height-8), max(3, len(operation.lines)))
+	boxHeight := min(height-4, visible+5)
+	if boxHeight < 7 {
+		return
+	}
+	top := max(1, (height-boxHeight)/2)
+	left := max(2, (width-boxWidth)/2)
+	putLine(lines, top, left, boxWidth, titledBoxLine(boxWidth, operation.title))
+	addRegion(regions, top, left, left+boxWidth, theme.Title)
+	for row := top + 1; row < top+boxHeight-1; row++ {
+		putLine(lines, row, left, boxWidth, "│"+strings.Repeat(" ", boxWidth-2)+"│")
+		addRegion(regions, row, left+1, left+boxWidth-1, theme.Selected)
+	}
+	putLine(lines, top+boxHeight-1, left, boxWidth, boxLine(boxWidth, '└', '┘'))
+	addRegion(regions, top+boxHeight-1, left, left+boxWidth, theme.Title)
+	start := max(0, len(operation.lines)-visible)
+	for index, line := range operation.lines[start:] {
+		if index >= visible {
+			break
+		}
+		text := clip(line, boxWidth-2)
+		putLine(lines, top+2+index, left, boxWidth, "│"+text+strings.Repeat(" ", max(0, boxWidth-2-len([]rune(text))))+"│")
+		addTextRegion(regions, top+2+index, left+1, boxWidth-2, text, theme.Selected)
+	}
+	hintText := "Esc cancel"
+	if operation.done {
+		hintText = "Press any key to close"
+	}
+	hint := centeredLine(hintText, boxWidth-2)
 	putLine(lines, top+boxHeight-2, left, boxWidth, "│"+hint+"│")
 	addTextRegion(regions, top+boxHeight-2, left+1, boxWidth-2, hint, theme.KeySelected)
 }

@@ -2,12 +2,15 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -36,6 +39,62 @@ func TestContainerItemAndPorts(t *testing.T) {
 	}
 }
 
+func TestFilterLogLines(t *testing.T) {
+	lines := []string{"INFO ready", "ERROR failed", "info healthy"}
+	if got := filterLogLines(lines, "error"); fmt.Sprint(got) != "[ERROR failed]" {
+		t.Fatalf("filtered logs = %v", got)
+	}
+	if got := filterLogLines(lines, "missing"); len(got) != 1 || !strings.Contains(got[0], "no log lines match") {
+		t.Fatalf("missing log result = %v", got)
+	}
+	if got := filterLogLines(lines, ""); fmt.Sprint(got) != fmt.Sprint(lines) {
+		t.Fatalf("empty filter changed logs = %v", got)
+	}
+}
+
+func TestUserConfigRoundTrip(t *testing.T) {
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	config := UserConfig{EndpointURL: "https://podman.example.test", RefreshSeconds: 4.5, Theme: "tokyo-night", LogLimit: 500, ConfirmDestructive: false}
+	if err := saveUserConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadUserConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.EndpointURL != config.EndpointURL || loaded.RefreshSeconds != config.RefreshSeconds || loaded.Theme != config.Theme || loaded.LogLimit != config.LogLimit || loaded.ConfirmDestructive != config.ConfirmDestructive {
+		t.Fatalf("loaded config = %+v, want %+v", loaded, config)
+	}
+}
+
+func TestRemotePodmanClientUsesConfiguredHTTPEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v5.0.0/libpod/_ping" {
+			t.Fatalf("remote path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	client := NewPodmanClient(server.URL)
+	if client.BaseURL != server.URL || client.SocketPath != server.URL {
+		t.Fatalf("remote client = %+v", client)
+	}
+	if _, err := client.get("/v5.0.0/libpod/_ping", nil); err != nil {
+		t.Fatalf("remote request failed: %v", err)
+	}
+}
+
+func TestEnsurePodmanSocketSkipsCustomSocket(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "custom.sock")
+	t.Setenv("LZPODY_SOCKET", socketPath)
+	if err := ensurePodmanSocket(&PodmanClient{SocketPath: socketPath}); err != nil {
+		t.Fatalf("custom socket startup = %v", err)
+	}
+}
+
 func TestModelsAndStats(t *testing.T) {
 	if got := containerStateLabel(containerItem(map[string]any{"Id": "c1", "Names": []any{"demo"}, "State": "exited", "Status": "Exited (0) 2 seconds ago"})); got != "exited (0)" {
 		t.Fatalf("state label = %q", got)
@@ -56,9 +115,9 @@ func TestModelsAndStats(t *testing.T) {
 	if numberValue(sample["CPU"]) != 12.5 || !strings.Contains(strings.Join(statsLines([]map[string]any{sample}), "\n"), "12.50") {
 		t.Fatalf("stats payload/lines failed: %+v", sample)
 	}
-	lines := statsLines([]map[string]any{{"CPU": 12.5, "MemPerc": 4.5}})
+	lines := statsLines([]map[string]any{{"CPU": 12.5, "MemPerc": 4.5, "NetInput": 100, "NetOutput": 200, "BlockInput": 300, "BlockOutput": 400}})
 	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "CPU (%)") || !strings.Contains(joined, "Memory (%)") || !strings.Contains(joined, "12.50") || !strings.Contains(joined, "┤") {
+	if !strings.Contains(joined, "CPU (%)") || !strings.Contains(joined, "Memory (%)") || !strings.Contains(joined, "Network I/O (bytes)") || !strings.Contains(joined, "Block I/O (bytes)") || !strings.Contains(joined, "12.50") || !strings.Contains(joined, "┤") {
 		t.Fatalf("cpu stats card missing: %v", lines)
 	}
 }
@@ -72,6 +131,265 @@ func TestLifecycleQueries(t *testing.T) {
 	}
 	if got := lifecycleQuery("kill").Get("signal"); got != "SIGKILL" {
 		t.Fatalf("kill query = %v", got)
+	}
+}
+
+func TestContainerPhaseTwoOperations(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "podman.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v5.0.0/libpod/containers/c1/init":
+			_, _ = w.Write([]byte(`{}`))
+		case "POST /v5.0.0/libpod/containers/c1/rename":
+			if r.URL.Query().Get("name") != "renamed" {
+				t.Errorf("rename query = %q", r.URL.Query().Get("name"))
+			}
+			_, _ = w.Write([]byte(`{}`))
+		case "POST /v5.0.0/libpod/containers/c1/wait":
+			if r.URL.Query().Get("condition") != "exited" {
+				t.Errorf("wait query = %q", r.URL.Query().Get("condition"))
+			}
+			_, _ = w.Write([]byte(`{"StatusCode":0}`))
+		case "GET /v5.0.0/libpod/containers/c1/healthcheck":
+			_, _ = w.Write([]byte(`{"Status":"healthy"}`))
+		case "GET /v5.0.0/libpod/containers/c1/changes":
+			_, _ = w.Write([]byte(`[{"Path":"/tmp/a","Kind":1}]`))
+		case "POST /v5.0.0/libpod/containers/c1/mount":
+			_, _ = w.Write([]byte(`"/run/user/1000/containers/c1"`))
+		case "POST /v5.0.0/libpod/containers/c1/unmount":
+			_, _ = w.Write([]byte(`{}`))
+		case "GET /v5.0.0/libpod/containers/c1/export":
+			w.Header().Set("Content-Type", "application/x-tar")
+			_, _ = w.Write([]byte("container archive"))
+		case "POST /v5.0.0/libpod/containers/c1/checkpoint":
+			if r.URL.Query().Get("export") != "true" {
+				t.Errorf("checkpoint query = %q", r.URL.Query().Get("export"))
+			}
+			w.Header().Set("Content-Type", "application/x-tar")
+			_, _ = w.Write([]byte("checkpoint archive"))
+		case "POST /v5.0.0/libpod/containers/c1/restore":
+			if r.URL.Query().Get("import") != "true" {
+				t.Errorf("restore query = %q", r.URL.Query().Get("import"))
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	client := NewPodmanClient(socketPath)
+	if err := client.initContainer("c1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.renameContainer("c1", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := client.waitContainer("c1", "exited"); err != nil || !strings.Contains(output, "StatusCode") {
+		t.Fatalf("wait = %q, err=%v", output, err)
+	}
+	if output, err := client.healthcheckContainer("c1"); err != nil || !strings.Contains(output, "healthy") {
+		t.Fatalf("healthcheck = %q, err=%v", output, err)
+	}
+	changes, err := client.containerChanges("c1")
+	if err != nil || !strings.Contains(valueText(changes), "tmp/a") {
+		t.Fatalf("changes = %v, err=%v", changes, err)
+	}
+	if mount, err := client.mountContainer("c1"); err != nil || mount == "" {
+		t.Fatalf("mount = %q, err=%v", mount, err)
+	}
+	if err := client.unmountContainer("c1"); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "container.tar")
+	if err := client.exportContainer("c1", destination); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil || string(data) != "container archive" {
+		t.Fatalf("exported archive = %q, err=%v", data, err)
+	}
+	checkpoint := filepath.Join(t.TempDir(), "checkpoint.tar.gz")
+	if err := client.checkpointContainer("c1", checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(checkpoint); err != nil || string(data) != "checkpoint archive" {
+		t.Fatalf("checkpoint archive = %q, err=%v", data, err)
+	}
+	if err := client.restoreContainer("c1", checkpoint); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRoadmapClientOperationsUseNativeEndpoints(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "podman.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	seen := map[string]bool{}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen[r.Method+" "+r.URL.Path] = true
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v5.0.0/libpod/system/df":
+			_, _ = w.Write([]byte(`{"ImagesSize":1}`))
+		case "POST /v5.0.0/libpod/system/check":
+			if r.URL.Query().Get("quick") != "true" || r.URL.Query().Get("repair") != "false" || r.URL.Query().Get("repair_lossy") != "false" || r.URL.Query().Get("unreferenced_layer_max_age") != "24h" {
+				t.Errorf("system check query = %v", r.URL.Query())
+			}
+			_, _ = w.Write([]byte(`{"Errors":[],"Repaired":[]}`))
+		case "POST /v5.0.0/libpod/commit":
+			if r.URL.Query().Get("container") != "c1" || r.URL.Query().Get("repo") != "demo" {
+				t.Errorf("commit query = %v", r.URL.Query())
+			}
+			_, _ = w.Write([]byte(`{"Id":"sha256:new"}`))
+		case "POST /v5.0.0/libpod/play/kube":
+			_, _ = w.Write([]byte(`{"Pods":[{"ID":"p1"}]}`))
+		case "DELETE /v5.0.0/libpod/play/kube":
+			_, _ = w.Write([]byte(`{"Pods":[{"ID":"p1"}]}`))
+		case "GET /v5.0.0/libpod/generate/kube":
+			if r.URL.Query().Get("names") != "p1" {
+				t.Errorf("generate kube query = %v", r.URL.Query())
+			}
+			_, _ = w.Write([]byte(`"apiVersion: v1\nkind: Pod\n"`))
+		case "GET /v5.0.0/libpod/generate/c1/systemd":
+			_, _ = w.Write([]byte(`"[Unit]\nDescription=demo\n"`))
+		case "POST /v5.0.0/libpod/manifests/create":
+			_, _ = w.Write([]byte(`{"Id":"manifest"}`))
+		case "POST /v5.0.0/libpod/manifests/manifest/add":
+			_, _ = w.Write([]byte(`{}`))
+		case "GET /v5.0.0/libpod/manifests/manifest/json":
+			_, _ = w.Write([]byte(`{"Instances":["linux/amd64"]}`))
+		case "POST /v5.0.0/libpod/manifests/manifest/push":
+			_, _ = w.Write([]byte(`{"Pushed":true}`))
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	client := NewPodmanClient(socketPath)
+	if value, err := client.systemDf(); err != nil || !strings.Contains(valueText(value), "ImagesSize") {
+		t.Fatalf("system df = %v, err=%v", value, err)
+	}
+	if output, err := client.systemCheck(true, false, false, "24h"); err != nil || !strings.Contains(output, "Errors") {
+		t.Fatalf("system check = %q, err=%v", output, err)
+	}
+	if value, err := client.commitContainer("c1", "demo", "latest", "test"); err != nil || !strings.Contains(value, "sha256:new") {
+		t.Fatalf("commit = %q, err=%v", value, err)
+	}
+	kubeFile := filepath.Join(t.TempDir(), "pod.yaml")
+	if err := os.WriteFile(kubeFile, []byte("apiVersion: v1\nkind: Pod\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := client.playKube(kubeFile, "podman", true); err != nil || !strings.Contains(value, "p1") {
+		t.Fatalf("kube play = %q, err=%v", value, err)
+	}
+	if value, err := client.downKube(kubeFile, true); err != nil || !strings.Contains(value, "p1") {
+		t.Fatalf("kube down = %q, err=%v", value, err)
+	}
+	if value, err := client.generateKube([]string{"p1"}, false); err != nil || !strings.Contains(value, "kind: Pod") {
+		t.Fatalf("kube generate = %q, err=%v", value, err)
+	}
+	if value, err := client.generateSystemd("container", "c1"); err != nil || !strings.Contains(value, "Description") {
+		t.Fatalf("systemd generate = %q, err=%v", value, err)
+	}
+	if value, err := client.createManifest("manifest", "demo:amd64", false); err != nil || !strings.Contains(value, "manifest") {
+		t.Fatalf("manifest create = %q, err=%v", value, err)
+	}
+	if err := client.addManifest("manifest", []string{"demo:arm64"}, false, "arm64", "linux", "v8"); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := client.inspectManifest("manifest"); err != nil || !strings.Contains(valueText(value), "linux/amd64") {
+		t.Fatalf("manifest inspect = %v, err=%v", value, err)
+	}
+	if value, err := client.pushManifest("manifest", "registry.example/demo", true); err != nil || !strings.Contains(value, "Pushed") {
+		t.Fatalf("manifest push = %q, err=%v", value, err)
+	}
+	for _, path := range []string{
+		"GET /v5.0.0/libpod/system/df", "POST /v5.0.0/libpod/system/check", "POST /v5.0.0/libpod/commit", "POST /v5.0.0/libpod/play/kube",
+		"DELETE /v5.0.0/libpod/play/kube", "GET /v5.0.0/libpod/generate/kube", "GET /v5.0.0/libpod/generate/c1/systemd",
+		"POST /v5.0.0/libpod/manifests/create", "POST /v5.0.0/libpod/manifests/manifest/add",
+		"GET /v5.0.0/libpod/manifests/manifest/json", "POST /v5.0.0/libpod/manifests/manifest/push",
+	} {
+		if !seen[path] {
+			t.Errorf("missing request %q", path)
+		}
+	}
+}
+
+func TestStatsStreamUsesLiveLibpodEndpoint(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "podman.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v5.0.0/libpod/containers/stats" || r.URL.Query().Get("stream") != "true" || r.URL.Query().Get("containers") != "c1" {
+			http.Error(w, "unexpected stats request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"CPU\":12.5,\"MemPerc\":4.0}\n"))
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	body, err := NewPodmanClient(socketPath).statsStream(context.Background(), "container", "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	scanner := bufio.NewScanner(body)
+	if !scanner.Scan() {
+		t.Fatal("stats stream returned no sample")
+	}
+	var value any
+	if err := json.Unmarshal(scanner.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	if sample := statsPayload(value); sample == nil || numberValue(sample["CPU"]) != 12.5 {
+		t.Fatalf("stats sample = %v", sample)
+	}
+}
+
+func TestEventsStreamUsesLiveEndpoint(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "podman.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v5.0.0/libpod/events" || r.URL.Query().Get("stream") != "true" {
+			http.Error(w, "unexpected events request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{\"status\":\"start\",\"id\":\"c1\"}\n"))
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	body, err := NewPodmanClient(socketPath).eventsStream(context.Background(), time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	scanner := bufio.NewScanner(body)
+	if !scanner.Scan() || !strings.Contains(scanner.Text(), "start") {
+		t.Fatalf("event stream line = %q", scanner.Text())
 	}
 }
 
@@ -96,6 +414,32 @@ func TestPodmanClientUsesUnixSocketAndNativePaths(t *testing.T) {
 	items, err := NewPodmanClient(socketPath).containers()
 	if err != nil || len(items) != 1 || scalarText(items[0]["Id"]) != "c1" {
 		t.Fatalf("containers() = %#v, err=%v", items, err)
+	}
+}
+
+func TestPodmanClientRetriesTransientGet(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "podman.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requests := 0
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			http.Error(w, "temporary unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	value, err := NewPodmanClient(socketPath).get("/v5.0.0/libpod/test", nil)
+	if err != nil || valueText(value) != "{\n  \"ok\": true\n}" || requests != 2 {
+		t.Fatalf("retrying GET = value:%q err:%v requests:%d", valueText(value), err, requests)
 	}
 }
 
@@ -924,6 +1268,91 @@ func TestPullProgressText(t *testing.T) {
 	}
 	if got := pullProgressText(`{"error":"unauthorized"}`); got != "Error: unauthorized" {
 		t.Fatalf("pull error progress = %q", got)
+	}
+}
+
+func TestOperationProgressTextSupportsPodmanStreamShapes(t *testing.T) {
+	cases := map[string]string{
+		`{"stream":"Step 1/2 : FROM alpine"}`:                 "Step 1/2 : FROM alpine",
+		`{"id":"layer1","status":"Pushing","progress":"50%"}`: "layer1 Pushing 50%",
+		`plain progress line`:                                 "plain progress line",
+		`{"error":"unauthorized"}`:                            "Error: unauthorized",
+	}
+	for input, want := range cases {
+		if got := operationProgressText(input); got != want {
+			t.Errorf("operationProgressText(%q) = %q, want %q", input, got, want)
+		}
+	}
+	_, done, err := operationProgressEvent(`{"error":"denied"}`)
+	if !done || err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("operation error event = done:%v err:%v", done, err)
+	}
+}
+
+func TestSystemPruneReportSupportsLibpodSchemaVariants(t *testing.T) {
+	value := map[string]any{
+		"ContainersDeleted": []any{"c1", "c2"},
+		"ImagesPruned":      []any{"i1"},
+		"VolumesDeleted":    2,
+		"SpaceReclaimed":    float64(2048),
+	}
+	report := systemPruneReport(value)
+	for _, want := range []string{"Containers removed", "2", "Images removed", "Volumes removed", "Space reclaimed", "2.0 KiB"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("system prune report %q does not contain %q", report, want)
+		}
+	}
+}
+
+func TestCapabilitiesParsingSupportsLibpodInfoShapes(t *testing.T) {
+	cases := []any{
+		map[string]any{"Version": "5.0.0"},
+		map[string]any{"Version": map[string]any{"Version": "4.9.4"}},
+		map[string]any{"version": "4.8.0"},
+	}
+	for _, value := range cases {
+		capabilities := capabilitiesFromInfo(value, "/v5.0.0/libpod")
+		if capabilities.APIVersion != "5.0.0" || capabilities.LibpodVersion == "" || !capabilities.SupportsSystemPrune || !capabilities.SupportsSecrets {
+			t.Errorf("capabilitiesFromInfo(%#v) = %+v", value, capabilities)
+		}
+	}
+}
+
+func TestOperationCancellationStaysInBubbleTeaState(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	called := false
+	app.Operation = &operationSession{title: "Build image", cancel: func() { called = true }, lines: []string{"building"}}
+	model := bubbleModel{app: app, width: 100, height: 30}
+	model.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	if !called || app.Operation == nil || !app.Operation.done || !app.Operation.cancelRequested || app.Status != "Build image cancelled" {
+		t.Fatalf("operation cancellation = called:%v operation:%+v status:%q", called, app.Operation, app.Status)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if app.Operation != nil {
+		t.Fatal("completed operation overlay did not close")
+	}
+}
+
+func TestLongOperationsUseBubbleTeaOverlay(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.Mode = "images"
+	app.Items["images"] = []Item{{Kind: "image", ID: "i1", Name: "alpine"}}
+	model := bubbleModel{app: app, width: 100, height: 30}
+
+	cmd := model.promptCommand("build", []string{"."})
+	if cmd == nil || app.Operation == nil || app.Operation.title != "Build image" {
+		t.Fatalf("build operation = cmd:%v operation:%+v", cmd != nil, app.Operation)
+	}
+	view := model.View()
+	for _, want := range []string{"Build image", "Esc cancel"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("operation overlay does not contain %q:\n%s", want, view)
+		}
+	}
+
+	model.Update(tea.KeyMsg{Type: tea.KeyEscape})
+	if app.Operation == nil || !app.Operation.cancelRequested {
+		t.Fatal("build operation was not cancellable through Bubble Tea")
 	}
 }
 

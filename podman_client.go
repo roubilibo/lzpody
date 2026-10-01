@@ -21,14 +21,28 @@ import (
 	"unicode/utf8"
 )
 
-type PodmanError struct{ Message string }
+type PodmanError struct {
+	Message string
+	Cause   error
+}
 
 func (e *PodmanError) Error() string { return e.Message }
+
+func (e *PodmanError) Unwrap() error { return e.Cause }
 
 type PodmanClient struct {
 	SocketPath string
 	APIRoot    string
+	BaseURL    string
 	HTTP       *http.Client
+}
+
+type PodmanCapabilities struct {
+	APIRoot             string
+	APIVersion          string
+	LibpodVersion       string
+	SupportsSystemPrune bool
+	SupportsSecrets     bool
 }
 
 type containerCreateOptions struct {
@@ -45,6 +59,12 @@ type networkCreateOptions struct {
 }
 
 func NewPodmanClient(socketPath string) *PodmanClient {
+	if socketPath == "" {
+		if endpoint := os.Getenv("LZPODY_URL"); endpoint != "" {
+			socketPath = endpoint
+		}
+	}
+	remote := strings.HasPrefix(socketPath, "http://") || strings.HasPrefix(socketPath, "https://")
 	if socketPath == "" {
 		runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
 		if runtimeDir == "" {
@@ -65,7 +85,7 @@ func NewPodmanClient(socketPath string) *PodmanClient {
 	if version == "" {
 		version = defaultAPIVersion
 	}
-	return &PodmanClient{
+	client := &PodmanClient{
 		SocketPath: socketPath,
 		APIRoot:    "/" + strings.Trim(version, "/") + "/libpod",
 		HTTP: &http.Client{
@@ -78,46 +98,85 @@ func NewPodmanClient(socketPath string) *PodmanClient {
 			},
 		},
 	}
+	if remote {
+		client.BaseURL = strings.TrimRight(socketPath, "/")
+		client.HTTP = &http.Client{Timeout: 5 * time.Second}
+	}
+	return client
+}
+
+func (c *PodmanClient) requestURL(path string) string {
+	if c.BaseURL != "" {
+		return c.BaseURL + path
+	}
+	return "http://podman" + path
 }
 
 func (c *PodmanClient) request(method, path string, query url.Values, body io.Reader) (any, error) {
-	return c.requestWithContentType(method, path, query, body, "application/json")
+	return c.requestWithContext(context.Background(), method, path, query, body, "application/json")
 }
 
 func (c *PodmanClient) requestWithContentType(method, path string, query url.Values, body io.Reader, contentType string) (any, error) {
+	return c.requestWithContext(context.Background(), method, path, query, body, contentType)
+}
+
+func (c *PodmanClient) requestWithContext(ctx context.Context, method, path string, query url.Values, body io.Reader, contentType string) (any, error) {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
 	if len(query) > 0 {
 		path += "?" + query.Encode()
 	}
-	req, err := http.NewRequest(method, "http://podman"+path, body)
-	if err != nil {
-		return nil, &PodmanError{Message: err.Error()}
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", contentType)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
-			return nil, &PodmanError{Message: fmt.Sprintf("Podman socket not found: %s. Recover with: systemctl --user restart podman.socket", c.SocketPath)}
+	retryable := method == http.MethodGet || method == http.MethodHead
+	var resp *http.Response
+	var err error
+	for attempt := 0; ; attempt++ {
+		req, requestErr := http.NewRequestWithContext(ctx, method, c.requestURL(path), body)
+		if requestErr != nil {
+			return nil, &PodmanError{Message: requestErr.Error(), Cause: requestErr}
 		}
-		return nil, &PodmanError{Message: "Cannot connect to Podman: " + err.Error()}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", contentType)
+		resp, err = c.HTTP.Do(req)
+		if err == nil && (!retryable || !retryableStatus(resp.StatusCode) || attempt >= 2) {
+			break
+		}
+		if err != nil && (!retryable || attempt >= 2 || !retryableNetworkError(err)) {
+			break
+		}
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		if waitErr := waitForRetry(ctx, attempt); waitErr != nil {
+			return nil, podmanContextError(waitErr)
+		}
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, podmanContextError(ctx.Err())
+		}
+		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
+			return nil, &PodmanError{Message: fmt.Sprintf("Podman socket not found: %s. Recover with: systemctl --user restart podman.socket", c.SocketPath), Cause: err}
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, &PodmanError{Message: "Podman request timed out", Cause: err}
+		}
+		return nil, &PodmanError{Message: "Cannot connect to Podman: " + err.Error(), Cause: err}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, &PodmanError{Message: "Cannot read Podman response: " + err.Error()}
+		if ctx.Err() != nil {
+			return nil, podmanContextError(ctx.Err())
+		}
+		return nil, &PodmanError{Message: "Cannot read Podman response: " + err.Error(), Cause: err}
 	}
 	if resp.StatusCode >= 300 {
-		message := strings.TrimSpace(string(raw))
-		if len(message) > 240 {
-			message = message[:237] + "..."
-		}
-		if message == "" {
-			message = resp.Status
-		}
-		return nil, &PodmanError{Message: fmt.Sprintf("Podman API %d: %s", resp.StatusCode, message)}
+		return nil, podmanHTTPError(resp, raw)
 	}
 	if len(raw) == 0 {
 		return nil, nil
@@ -139,6 +198,48 @@ func (c *PodmanClient) requestWithContentType(method, path string, query url.Val
 		return nil, &PodmanError{Message: "Podman returned invalid JSON"}
 	}
 	return string(raw), nil
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+func retryableNetworkError(err error) bool {
+	if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
+		return false
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())
+}
+
+func waitForRetry(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt+1) * 100 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func podmanContextError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return &PodmanError{Message: "Operation cancelled", Cause: context.Canceled}
+	}
+	return &PodmanError{Message: "Podman request timed out", Cause: err}
+}
+
+func podmanHTTPError(resp *http.Response, raw []byte) error {
+	message := strings.TrimSpace(string(raw))
+	if len(message) > 240 {
+		message = message[:237] + "..."
+	}
+	if message == "" {
+		message = resp.Status
+	}
+	return &PodmanError{Message: fmt.Sprintf("Podman API %d: %s", resp.StatusCode, message)}
 }
 
 func (c *PodmanClient) postValue(path string, query url.Values, body io.Reader, contentType string) (any, error) {
@@ -258,6 +359,105 @@ func (c *PodmanClient) podStats(id string) (any, error) {
 }
 func (c *PodmanClient) top(id string) (any, error) {
 	return c.get(idPath(c.APIRoot+"/containers", id)+"/top", nil)
+}
+
+func (c *PodmanClient) initContainer(id string) error {
+	return c.post(idPath(c.APIRoot+"/containers", id)+"/init", nil)
+}
+
+func (c *PodmanClient) renameContainer(id, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("new container name is required")
+	}
+	return c.post(idPath(c.APIRoot+"/containers", id)+"/rename", url.Values{"name": {strings.TrimSpace(name)}})
+}
+
+func (c *PodmanClient) waitContainer(id, condition string) (string, error) {
+	condition = strings.TrimSpace(condition)
+	if condition == "" {
+		condition = "stopped"
+	}
+	value, err := c.postValue(idPath(c.APIRoot+"/containers", id)+"/wait", url.Values{"condition": {condition}}, nil, "application/json")
+	return valueText(value), err
+}
+
+func (c *PodmanClient) healthcheckContainer(id string) (string, error) {
+	value, err := c.get(idPath(c.APIRoot+"/containers", id)+"/healthcheck", nil)
+	return valueText(value), err
+}
+
+func (c *PodmanClient) containerChanges(id string) (any, error) {
+	return c.get(idPath(c.APIRoot+"/containers", id)+"/changes", nil)
+}
+
+func (c *PodmanClient) mountContainer(id string) (string, error) {
+	value, err := c.postValue(idPath(c.APIRoot+"/containers", id)+"/mount", nil, nil, "application/json")
+	return valueText(value), err
+}
+
+func (c *PodmanClient) unmountContainer(id string) error {
+	return c.post(idPath(c.APIRoot+"/containers", id)+"/unmount", nil)
+}
+
+func (c *PodmanClient) exportContainer(id, destination string) error {
+	if strings.TrimSpace(destination) == "" {
+		return fmt.Errorf("destination path is required")
+	}
+	resp, err := c.doArchiveRequest(http.MethodGet, idPath(c.APIRoot+"/containers", id)+"/export", nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	file, err := os.Create(destination)
+	if err != nil {
+		return &PodmanError{Message: "Cannot create container archive: " + err.Error()}
+	}
+	if _, err = io.Copy(file, resp.Body); err != nil {
+		_ = file.Close()
+		return &PodmanError{Message: "Cannot export container archive: " + err.Error()}
+	}
+	if err = file.Close(); err != nil {
+		return &PodmanError{Message: "Cannot close container archive: " + err.Error()}
+	}
+	return nil
+}
+
+func (c *PodmanClient) checkpointContainer(id, destination string) error {
+	if strings.TrimSpace(destination) == "" {
+		return fmt.Errorf("checkpoint destination path is required")
+	}
+	resp, err := c.doArchiveRequest(http.MethodPost, idPath(c.APIRoot+"/containers", id)+"/checkpoint", url.Values{"export": {"true"}}, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	file, err := os.Create(destination)
+	if err != nil {
+		return &PodmanError{Message: "Cannot create checkpoint archive: " + err.Error()}
+	}
+	if _, err = io.Copy(file, resp.Body); err != nil {
+		_ = file.Close()
+		return &PodmanError{Message: "Cannot save checkpoint archive: " + err.Error()}
+	}
+	if err = file.Close(); err != nil {
+		return &PodmanError{Message: "Cannot close checkpoint archive: " + err.Error()}
+	}
+	return nil
+}
+
+func (c *PodmanClient) restoreContainer(id, source string) error {
+	file, err := os.Open(source)
+	if err != nil {
+		return &PodmanError{Message: "Cannot open checkpoint archive: " + err.Error()}
+	}
+	defer file.Close()
+	resp, err := c.doArchiveRequest(http.MethodPost, idPath(c.APIRoot+"/containers", id)+"/restore", url.Values{"import": {"true"}}, file)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, err = io.Copy(io.Discard, resp.Body)
+	return err
 }
 
 func lifecycleQuery(action string) url.Values {
@@ -654,39 +854,9 @@ func (c *PodmanClient) pullImage(reference string) error {
 	return nil
 }
 
-func (c *PodmanClient) pullImageStream(reference string) (io.ReadCloser, error) {
+func (c *PodmanClient) pullImageStream(ctx context.Context, reference string) (io.ReadCloser, error) {
 	path := c.APIRoot + "/images/pull?" + url.Values{"reference": {reference}}.Encode()
-	req, err := http.NewRequest(http.MethodPost, "http://podman"+path, nil)
-	if err != nil {
-		return nil, &PodmanError{Message: err.Error()}
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	streamClient := *c.HTTP
-	streamClient.Timeout = 0
-	resp, err := streamClient.Do(req)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
-			return nil, &PodmanError{Message: fmt.Sprintf("Podman socket not found: %s. Recover with: systemctl --user restart podman.socket", c.SocketPath)}
-		}
-		return nil, &PodmanError{Message: "Cannot connect to Podman: " + err.Error()}
-	}
-	if resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		raw, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return nil, &PodmanError{Message: "Cannot read Podman response: " + readErr.Error()}
-		}
-		message := strings.TrimSpace(string(raw))
-		if len(message) > 240 {
-			message = message[:237] + "..."
-		}
-		if message == "" {
-			message = resp.Status
-		}
-		return nil, &PodmanError{Message: fmt.Sprintf("Podman API %d: %s", resp.StatusCode, message)}
-	}
-	return resp.Body, nil
+	return c.openStream(ctx, http.MethodPost, path, nil, "application/json")
 }
 
 func (c *PodmanClient) pushImage(source, destination string) error {
@@ -700,6 +870,66 @@ func (c *PodmanClient) pushImage(source, destination string) error {
 		}
 	}
 	return nil
+}
+
+func (c *PodmanClient) buildImageStream(ctx context.Context, contextDir, tag string) (io.ReadCloser, error) {
+	archive, err := tarDirectoryContext(ctx, contextDir)
+	if err != nil {
+		return nil, err
+	}
+	query := url.Values{}
+	if tag != "" {
+		query.Set("t", tag)
+	}
+	path := c.APIRoot + "/build"
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	return c.openStream(ctx, http.MethodPost, path, bytes.NewReader(archive), "application/x-tar")
+}
+
+func (c *PodmanClient) pushImageStream(ctx context.Context, source, destination string) (io.ReadCloser, error) {
+	path := idPath(c.APIRoot+"/images", source) + "/push?" + url.Values{"destination": {destination}}.Encode()
+	return c.openStream(ctx, http.MethodPost, path, nil, "application/json")
+}
+
+func (c *PodmanClient) openStream(ctx context.Context, method, path string, body io.Reader, contentType string) (io.ReadCloser, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.requestURL(path), body)
+	if err != nil {
+		return nil, &PodmanError{Message: err.Error(), Cause: err}
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", contentType)
+	streamClient := *c.HTTP
+	streamClient.Timeout = 0
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, podmanContextError(ctx.Err())
+		}
+		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
+			return nil, &PodmanError{Message: fmt.Sprintf("Podman socket not found: %s. Recover with: systemctl --user restart podman.socket", c.SocketPath), Cause: err}
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, &PodmanError{Message: "Podman request timed out", Cause: err}
+		}
+		return nil, &PodmanError{Message: "Cannot connect to Podman: " + err.Error(), Cause: err}
+	}
+	if resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		raw, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			if ctx.Err() != nil {
+				return nil, podmanContextError(ctx.Err())
+			}
+			return nil, &PodmanError{Message: "Cannot read Podman response: " + readErr.Error(), Cause: readErr}
+		}
+		return nil, podmanHTTPError(resp, raw)
+	}
+	return resp.Body, nil
 }
 
 func (c *PodmanClient) pruneImages() error {
@@ -845,12 +1075,19 @@ func (c *PodmanClient) importImage(source, reference string) error {
 }
 
 func (c *PodmanClient) doArchiveRequest(method, path string, query url.Values, body io.Reader) (*http.Response, error) {
+	return c.doArchiveRequestContext(context.Background(), method, path, query, body)
+}
+
+func (c *PodmanClient) doArchiveRequestContext(ctx context.Context, method, path string, query url.Values, body io.Reader) (*http.Response, error) {
 	if len(query) > 0 {
 		path += "?" + query.Encode()
 	}
-	req, err := http.NewRequest(method, "http://podman"+path, body)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.requestURL(path), body)
 	if err != nil {
-		return nil, &PodmanError{Message: err.Error()}
+		return nil, &PodmanError{Message: err.Error(), Cause: err}
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -858,12 +1095,21 @@ func (c *PodmanClient) doArchiveRequest(method, path string, query url.Values, b
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, &PodmanError{Message: "Cannot connect to Podman: " + err.Error()}
+		if ctx.Err() != nil {
+			return nil, podmanContextError(ctx.Err())
+		}
+		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
+			return nil, &PodmanError{Message: fmt.Sprintf("Podman socket not found: %s. Recover with: systemctl --user restart podman.socket", c.SocketPath), Cause: err}
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, &PodmanError{Message: "Podman request timed out", Cause: err}
+		}
+		return nil, &PodmanError{Message: "Cannot connect to Podman: " + err.Error(), Cause: err}
 	}
 	if resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, &PodmanError{Message: fmt.Sprintf("Podman API %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))}
+		return nil, podmanHTTPError(resp, raw)
 	}
 	return resp, nil
 }
@@ -884,6 +1130,10 @@ func (c *PodmanClient) uploadImageArchive(source, endpoint string, query url.Val
 }
 
 func (c *PodmanClient) systemPrune(all, volumes, build bool, filters []string) (string, error) {
+	return c.systemPruneContext(context.Background(), all, volumes, build, filters)
+}
+
+func (c *PodmanClient) systemPruneContext(ctx context.Context, all, volumes, build bool, filters []string) (string, error) {
 	query := url.Values{
 		"all":     {strconv.FormatBool(all)},
 		"volumes": {strconv.FormatBool(volumes)},
@@ -894,14 +1144,140 @@ func (c *PodmanClient) systemPrune(all, volumes, build bool, filters []string) (
 			query.Add("filter", filter)
 		}
 	}
-	value, err := c.postValue(c.APIRoot+"/system/prune", query, nil, "application/json")
+	value, err := c.requestWithContext(ctx, http.MethodPost, c.APIRoot+"/system/prune", query, nil, "application/json")
 	if err != nil {
 		return "", err
 	}
 	if value == nil {
 		return "No unused resources were pruned.", nil
 	}
+	return systemPruneReport(value), nil
+}
+
+func (c *PodmanClient) systemDf() (any, error) {
+	return c.get(c.APIRoot+"/system/df", nil)
+}
+
+func (c *PodmanClient) systemCheckContext(ctx context.Context, quick, repair, repairLossy bool, maxAge string) (string, error) {
+	query := url.Values{
+		"quick":        {strconv.FormatBool(quick)},
+		"repair":       {strconv.FormatBool(repair)},
+		"repair_lossy": {strconv.FormatBool(repairLossy)},
+	}
+	if strings.TrimSpace(maxAge) != "" {
+		query.Set("unreferenced_layer_max_age", strings.TrimSpace(maxAge))
+	}
+	value, err := c.requestWithContext(ctx, http.MethodPost, c.APIRoot+"/system/check", query, nil, "application/json")
+	if err != nil {
+		return "", err
+	}
 	return valueText(value), nil
+}
+
+func (c *PodmanClient) systemCheck(quick, repair, repairLossy bool, maxAge string) (string, error) {
+	return c.systemCheckContext(context.Background(), quick, repair, repairLossy, maxAge)
+}
+
+func (c *PodmanClient) commitContainer(id, repository, tag, comment string) (string, error) {
+	if strings.TrimSpace(repository) == "" {
+		return "", fmt.Errorf("image repository is required")
+	}
+	query := url.Values{"container": {id}, "repo": {strings.TrimSpace(repository)}, "pause": {"true"}}
+	if strings.TrimSpace(tag) != "" {
+		query.Set("tag", strings.TrimSpace(tag))
+	}
+	if strings.TrimSpace(comment) != "" {
+		query.Set("comment", strings.TrimSpace(comment))
+	}
+	value, err := c.postValue(c.APIRoot+"/commit", query, nil, "application/json")
+	if err != nil {
+		return "", err
+	}
+	return valueText(value), nil
+}
+
+func (c *PodmanClient) generateSystemd(kind, id string) (string, error) {
+	if kind != "container" && kind != "pod" {
+		return "", fmt.Errorf("systemd generation is only supported for containers and pods")
+	}
+	value, err := c.get(idPath(c.APIRoot+"/generate", id)+"/systemd", url.Values{"useName": {"true"}})
+	return valueText(value), err
+}
+
+func (c *PodmanClient) quadletFile(kind, id string) (string, error) {
+	if kind != "container" && kind != "pod" {
+		return "", fmt.Errorf("quadlet output is only supported for containers and pods")
+	}
+	value, err := c.get(idPath(c.APIRoot+"/quadlets", id)+"/file", nil)
+	return valueText(value), err
+}
+
+func (c *PodmanClient) playKube(source, network string, start bool) (string, error) {
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return "", &PodmanError{Message: "Cannot read Kubernetes YAML: " + err.Error()}
+	}
+	query := url.Values{"start": {strconv.FormatBool(start)}}
+	if strings.TrimSpace(network) != "" {
+		query.Set("network", strings.TrimSpace(network))
+	}
+	value, err := c.postValue(c.APIRoot+"/play/kube", query, bytes.NewReader(data), "application/yaml")
+	return valueText(value), err
+}
+
+func (c *PodmanClient) downKube(source string, force bool) (string, error) {
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return "", &PodmanError{Message: "Cannot read Kubernetes YAML: " + err.Error()}
+	}
+	query := url.Values{"force": {strconv.FormatBool(force)}}
+	value, err := c.requestWithContentType(http.MethodDelete, c.APIRoot+"/play/kube", query, bytes.NewReader(data), "application/yaml")
+	return valueText(value), err
+}
+
+func (c *PodmanClient) generateKube(names []string, service bool) (string, error) {
+	query := url.Values{"service": {strconv.FormatBool(service)}}
+	for _, name := range compactValues(names) {
+		query.Add("names", name)
+	}
+	if len(query["names"]) == 0 {
+		return "", fmt.Errorf("a container or pod name is required")
+	}
+	value, err := c.get(c.APIRoot+"/generate/kube", query)
+	return valueText(value), err
+}
+
+func (c *PodmanClient) createManifest(name, image string, all bool) (string, error) {
+	query := url.Values{"name": {name}, "all": {strconv.FormatBool(all)}}
+	if strings.TrimSpace(image) != "" {
+		query.Set("image", strings.TrimSpace(image))
+	}
+	value, err := c.postValue(c.APIRoot+"/manifests/create", query, nil, "application/json")
+	return valueText(value), err
+}
+
+func (c *PodmanClient) addManifest(name string, images []string, all bool, arch, osName, variant string) error {
+	payload := map[string]any{"images": compactValues(images), "all": all}
+	if strings.TrimSpace(arch) != "" {
+		payload["arch"] = strings.TrimSpace(arch)
+	}
+	if strings.TrimSpace(osName) != "" {
+		payload["os"] = strings.TrimSpace(osName)
+	}
+	if strings.TrimSpace(variant) != "" {
+		payload["variant"] = strings.TrimSpace(variant)
+	}
+	_, err := c.postJSON(idPath(c.APIRoot+"/manifests", name)+"/add", nil, payload)
+	return err
+}
+
+func (c *PodmanClient) inspectManifest(name string) (any, error) {
+	return c.get(idPath(c.APIRoot+"/manifests", name)+"/json", nil)
+}
+
+func (c *PodmanClient) pushManifest(name, destination string, all bool) (string, error) {
+	value, err := c.postValue(idPath(c.APIRoot+"/manifests", name)+"/push", url.Values{"destination": {destination}, "all": {strconv.FormatBool(all)}}, nil, "application/json")
+	return valueText(value), err
 }
 
 func (c *PodmanClient) pruneResource(kind string) error {
@@ -933,6 +1309,13 @@ func (c *PodmanClient) buildImage(contextDir, tag string) error {
 }
 
 func tarDirectory(root string) ([]byte, error) {
+	return tarDirectoryContext(context.Background(), root)
+}
+
+func tarDirectoryContext(ctx context.Context, root string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return nil, &PodmanError{Message: "Invalid build context: " + err.Error()}
@@ -940,6 +1323,9 @@ func tarDirectory(root string) ([]byte, error) {
 	var output bytes.Buffer
 	writer := tar.NewWriter(&output)
 	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -974,6 +1360,9 @@ func tarDirectory(root string) ([]byte, error) {
 	})
 	closeErr := writer.Close()
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, podmanContextError(err)
+		}
 		return nil, &PodmanError{Message: "Cannot archive build context: " + err.Error()}
 	}
 	if closeErr != nil {
@@ -1082,6 +1471,47 @@ func (c *PodmanClient) copyFromContainer(id, source, destination string) error {
 
 func (c *PodmanClient) info() (any, error) {
 	return c.get(c.APIRoot+"/info", nil)
+}
+
+func (c *PodmanClient) detectCapabilities() (PodmanCapabilities, error) {
+	value, err := c.info()
+	if err != nil {
+		return PodmanCapabilities{}, err
+	}
+	return capabilitiesFromInfo(value, c.APIRoot), nil
+}
+
+func capabilitiesFromInfo(value any, apiRoot string) PodmanCapabilities {
+	apiVersion := ""
+	parts := strings.Split(strings.Trim(apiRoot, "/"), "/")
+	if len(parts) > 0 {
+		apiVersion = strings.TrimPrefix(parts[0], "v")
+	}
+	capabilities := PodmanCapabilities{
+		APIRoot:             apiRoot,
+		APIVersion:          apiVersion,
+		SupportsSystemPrune: true,
+		SupportsSecrets:     true,
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return capabilities
+	}
+	for _, key := range []string{"Version", "version", "GitVersion", "gitVersion"} {
+		if version := scalarText(object[key]); version != "" {
+			capabilities.LibpodVersion = version
+			break
+		}
+	}
+	if versionObject, ok := object["Version"].(map[string]any); ok {
+		for _, key := range []string{"Version", "version", "GitVersion", "gitVersion"} {
+			if version := scalarText(versionObject[key]); version != "" {
+				capabilities.LibpodVersion = version
+				break
+			}
+		}
+	}
+	return capabilities
 }
 
 func (c *PodmanClient) events(since time.Time) (any, error) {

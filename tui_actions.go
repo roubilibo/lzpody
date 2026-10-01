@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -61,6 +64,11 @@ func (a *App) beginPrompt(action string) {
 		"create_network":     {{label: "Network name"}, {label: "Driver (bridge/macvlan/ipvlan)"}, {label: "Subnet(s), comma-separated"}, {label: "Gateway(s), comma-separated"}, {label: "IP range(s), comma-separated"}, {label: "IPv6? yes/no"}, {label: "Internal? yes/no"}, {label: "Labels key=value,... | driver options key=value,..."}},
 		"create_secret":      {{label: "Secret name"}, {label: "Secret file path"}},
 		"exec":               {{label: "Command"}},
+		"rename":             {{label: "New container name"}},
+		"wait":               {{label: "Condition (configured/created/exited/paused/running/stopped)"}},
+		"export":             {{label: "Destination .tar path"}},
+		"checkpoint":         {{label: "Checkpoint destination .tar.gz path"}},
+		"restore":            {{label: "Checkpoint source .tar.gz path"}},
 		"copy_to":            {{label: "Local file | container path"}},
 		"copy_from":          {{label: "Container path | local path"}},
 		"network_connect":    {{label: "Container name or ID"}},
@@ -70,6 +78,15 @@ func (a *App) beginPrompt(action string) {
 		"prune_volumes":      {{label: "Type YES to prune unused volumes"}},
 		"prune_networks":     {{label: "Type YES to prune unused networks"}},
 		"system_prune":       {{label: "YES | all | volumes | build | filters (comma-separated)"}},
+		"system_check":       {{label: "quick yes/no | repair yes/no | repair-lossy yes/no | max age (optional)"}},
+		"settings":           {{label: "socket or http(s) URL | refresh seconds | theme | log limit | confirm yes/no"}},
+		"commit":             {{label: "Repository | tag | comment"}},
+		"kube_play":          {{label: "YAML path | network | start yes/no"}},
+		"kube_down":          {{label: "YAML path | force yes/no"}},
+		"kube_generate":      {{label: "Destination YAML path (optional) | service yes/no"}},
+		"manifest_create":    {{label: "Manifest name | image (optional) | all yes/no"}},
+		"manifest_add":       {{label: "Manifest name | images comma-separated | arch | os | variant"}},
+		"manifest_push":      {{label: "Destination | all yes/no"}},
 	}
 	if selected, ok := steps[action]; ok {
 		a.Prompt = &promptState{action: action, steps: selected}
@@ -284,14 +301,204 @@ func parseNetworkCreate(values []string) networkCreateOptions {
 }
 
 func (m Model) promptCommand(action string, values []string) tea.Cmd {
+	if action == "settings" {
+		return func() tea.Msg {
+			message := bubbleActionMsg{action: action, name: "settings"}
+			config := m.app.Config
+			parts := splitPrompt(promptValue(values, 0), 5)
+			if len(parts) > 0 && parts[0] != "" {
+				if strings.HasPrefix(parts[0], "http://") || strings.HasPrefix(parts[0], "https://") {
+					config.EndpointURL = strings.TrimRight(parts[0], "/")
+					config.SocketPath = ""
+				} else {
+					config.SocketPath = parts[0]
+					config.EndpointURL = ""
+				}
+			}
+			if len(parts) > 1 && parts[1] != "" {
+				seconds, err := strconv.ParseFloat(parts[1], 64)
+				if err != nil || seconds < 0.1 || seconds > 60 {
+					message.err = fmt.Errorf("refresh interval must be between 0.1 and 60 seconds")
+					return message
+				}
+				config.RefreshSeconds = seconds
+			}
+			if len(parts) > 2 && parts[2] != "" {
+				config.Theme = parts[2]
+			}
+			if len(parts) > 3 && parts[3] != "" {
+				limit, err := strconv.Atoi(parts[3])
+				if err != nil || limit < 20 || limit > 10000 {
+					message.err = fmt.Errorf("log limit must be between 20 and 10000 lines")
+					return message
+				}
+				config.LogLimit = limit
+			}
+			if len(parts) > 4 && parts[4] != "" {
+				switch strings.ToLower(parts[4]) {
+				case "yes", "true":
+					config.ConfirmDestructive = true
+				case "no", "false":
+					config.ConfirmDestructive = false
+				default:
+					message.err = fmt.Errorf("confirm value must be yes or no")
+					return message
+				}
+			}
+			config = config.normalized()
+			message.err = saveUserConfig(config)
+			if message.err == nil {
+				message.config = &config
+				endpoint := config.SocketPath
+				if config.EndpointURL != "" {
+					endpoint = config.EndpointURL
+				}
+				message.output = fmt.Sprintf("Settings saved\nEndpoint: %s\nRefresh: %.1fs\nTheme: %s\nLog limit: %d", defaultText(endpoint, "Podman default"), config.RefreshSeconds, defaultText(config.Theme, "automatic"), config.LogLimit)
+			}
+			return message
+		}
+	}
 	if action == "pull" {
 		if len(values) == 0 || values[0] == "" {
 			return func() tea.Msg { return pullStartedMsg{err: fmt.Errorf("image reference is required")} }
 		}
-		m.app.Pull = &pullSession{reference: values[0], lines: []string{"Connecting to Podman..."}}
+		ctx, cancel := context.WithCancel(context.Background())
+		m.app.Pull = &pullSession{reference: values[0], lines: []string{"Connecting to Podman..."}, cancel: cancel}
 		m.app.PullOverlay = true
 		m.app.Status = "Connecting to Podman..."
-		return m.startPullCmd(values[0])
+		return m.startPullCmd(ctx, m.app.Pull, values[0])
+	}
+	if action == "rename" || action == "wait" || action == "export" || action == "checkpoint" || action == "restore" {
+		item := m.app.current()
+		itemCopy := Item{}
+		if item != nil {
+			itemCopy = *item
+		}
+		return func() tea.Msg {
+			message := bubbleActionMsg{action: action, itemID: itemCopy.ID, name: itemCopy.Name}
+			if itemCopy.Kind != "container" || itemCopy.ID == "" {
+				message.err = fmt.Errorf("a selected container is required")
+				return message
+			}
+			switch action {
+			case "rename":
+				message.err = m.app.Client.renameContainer(itemCopy.ID, promptValue(values, 0))
+			case "wait":
+				message.output, message.err = m.app.Client.waitContainer(itemCopy.ID, promptValue(values, 0))
+			case "export":
+				message.err = m.app.Client.exportContainer(itemCopy.ID, promptValue(values, 0))
+			case "checkpoint":
+				message.err = m.app.Client.checkpointContainer(itemCopy.ID, promptValue(values, 0))
+			case "restore":
+				message.err = m.app.Client.restoreContainer(itemCopy.ID, promptValue(values, 0))
+			}
+			return message
+		}
+	}
+	if action == "commit" || action == "kube_play" || action == "kube_down" || action == "kube_generate" || action == "manifest_create" || action == "manifest_add" || action == "manifest_push" {
+		item := m.app.current()
+		itemCopy := Item{}
+		if item != nil {
+			itemCopy = *item
+		}
+		return func() tea.Msg {
+			message := bubbleActionMsg{action: action, itemID: itemCopy.ID, name: itemCopy.Name}
+			parts := splitPrompt(promptValue(values, 0), 5)
+			var output string
+			switch action {
+			case "commit":
+				if itemCopy.Kind != "container" {
+					message.err = fmt.Errorf("select a container to commit")
+				} else {
+					fields := splitPrompt(promptValue(values, 0), 3)
+					if len(fields) == 0 || fields[0] == "" {
+						message.err = fmt.Errorf("image repository is required")
+					} else {
+						output, message.err = m.app.Client.commitContainer(itemCopy.ID, fields[0], promptValue(fields, 1), promptValue(fields, 2))
+					}
+				}
+			case "kube_play":
+				start := true
+				if len(parts) > 2 && parts[2] != "" {
+					start = !strings.EqualFold(parts[2], "no") && !strings.EqualFold(parts[2], "false")
+				}
+				if parts[0] == "" {
+					message.err = fmt.Errorf("Kubernetes YAML path is required")
+				} else {
+					output, message.err = m.app.Client.playKube(parts[0], promptValue(parts, 1), start)
+				}
+			case "kube_down":
+				force := len(parts) > 1 && (strings.EqualFold(parts[1], "yes") || strings.EqualFold(parts[1], "true"))
+				if parts[0] == "" {
+					message.err = fmt.Errorf("Kubernetes YAML path is required")
+				} else {
+					output, message.err = m.app.Client.downKube(parts[0], force)
+				}
+			case "kube_generate":
+				if itemCopy.Kind != "container" && itemCopy.Kind != "pod" {
+					message.err = fmt.Errorf("select a container or pod to generate Kubernetes YAML")
+				} else {
+					service := len(parts) > 1 && (strings.EqualFold(parts[1], "yes") || strings.EqualFold(parts[1], "true"))
+					output, message.err = m.app.Client.generateKube([]string{itemCopy.ID}, service)
+					if message.err == nil && parts[0] != "" {
+						message.err = os.WriteFile(parts[0], []byte(output+"\n"), 0o600)
+						if message.err == nil {
+							output = "Kubernetes YAML saved to " + parts[0]
+						}
+					}
+				}
+			case "manifest_create":
+				if parts[0] == "" {
+					message.err = fmt.Errorf("manifest name is required")
+				} else {
+					all := len(parts) > 2 && (strings.EqualFold(parts[2], "yes") || strings.EqualFold(parts[2], "true"))
+					output, message.err = m.app.Client.createManifest(parts[0], promptValue(parts, 1), all)
+				}
+			case "manifest_add":
+				if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+					message.err = fmt.Errorf("manifest name and images are required")
+				} else {
+					message.err = m.app.Client.addManifest(parts[0], strings.Split(parts[1], ","), false, promptValue(parts, 2), promptValue(parts, 3), promptValue(parts, 4))
+				}
+			case "manifest_push":
+				if itemCopy.Kind != "image" || parts[0] == "" {
+					message.err = fmt.Errorf("select a manifest image and provide a destination")
+				} else {
+					all := len(parts) > 1 && (strings.EqualFold(parts[1], "yes") || strings.EqualFold(parts[1], "true"))
+					output, message.err = m.app.Client.pushManifest(itemCopy.ID, parts[0], all)
+				}
+			}
+			message.output = output
+			return message
+		}
+	}
+	if action == "build" || action == "push" || action == "system_prune" || action == "system_check" {
+		value := promptValue(values, 0)
+		if action == "build" {
+			parts := splitPrompt(value, 2)
+			if len(parts) == 0 || parts[0] == "" {
+				return func() tea.Msg { return bubbleActionMsg{action: action, err: fmt.Errorf("build context is required")} }
+			}
+		}
+		if action == "push" {
+			parts := splitPrompt(value, 2)
+			if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+				return func() tea.Msg {
+					return bubbleActionMsg{action: action, err: fmt.Errorf("source and destination are required")}
+				}
+			}
+		}
+		if action == "system_prune" {
+			parts := splitPrompt(value, 5)
+			if len(parts) == 0 || !strings.EqualFold(parts[0], "yes") {
+				return func() tea.Msg {
+					return bubbleActionMsg{action: action, err: fmt.Errorf("system prune cancelled: type YES to confirm")}
+				}
+			}
+		}
+		titles := map[string]string{"build": "Build image", "push": "Push image", "system_prune": "System prune", "system_check": "Storage check"}
+		session, ctx := m.beginOperation(action, titles[action])
+		return m.startOperationCmd(action, values, session, ctx)
 	}
 	client := m.app.Client
 	item := m.app.current()
@@ -308,24 +515,6 @@ func (m Model) promptCommand(action string, values []string) tea.Cmd {
 				err = fmt.Errorf("image reference is required")
 			} else {
 				_, err = client.createContainerWithOptions(parseContainerCreate(values))
-			}
-		case "build":
-			parts := splitPrompt(values[0], 2)
-			if len(parts) == 0 || parts[0] == "" {
-				err = fmt.Errorf("build context is required")
-			} else {
-				tag := ""
-				if len(parts) > 1 {
-					tag = parts[1]
-				}
-				err = client.buildImage(parts[0], tag)
-			}
-		case "push":
-			parts := splitPrompt(values[0], 2)
-			if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-				err = fmt.Errorf("source and destination are required")
-			} else {
-				err = client.pushImage(parts[0], parts[1])
 			}
 		case "image_tag":
 			parts := splitPrompt(values[0], 2)
@@ -424,20 +613,6 @@ func (m Model) promptCommand(action string, values []string) tea.Cmd {
 			} else {
 				err = fmt.Errorf("%s prune cancelled", strings.TrimPrefix(action, "prune_"))
 			}
-		case "system_prune":
-			parts := splitPrompt(values[0], 5)
-			if len(parts) == 0 || !strings.EqualFold(parts[0], "yes") {
-				err = fmt.Errorf("system prune cancelled: type YES to confirm")
-				break
-			}
-			all := len(parts) > 1 && strings.EqualFold(parts[1], "all")
-			volumes := len(parts) > 2 && strings.EqualFold(parts[2], "volumes")
-			build := len(parts) > 3 && strings.EqualFold(parts[3], "build")
-			filters := []string{}
-			if len(parts) > 4 && parts[4] != "" {
-				filters = strings.Split(parts[4], ",")
-			}
-			message.output, err = client.systemPrune(all, volumes, build, filters)
 		}
 		message.err = err
 		return message

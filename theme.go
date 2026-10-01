@@ -41,15 +41,20 @@ func colorStyle(foreground, background string, bold bool) lipgloss.Style {
 	return style
 }
 
-func loadUITheme() UITheme {
+func loadUITheme(preferred ...string) UITheme {
 	colors := make(map[string]string, len(defaultThemeColors))
 	for key, value := range defaultThemeColors {
 		colors[key] = value
 	}
 	themeID := ""
+	if len(preferred) > 0 {
+		themeID = strings.TrimSpace(preferred[0])
+	}
 	statePath := filepath.Join(os.Getenv("HOME"), ".local/state/omarchy/current/theme.name")
-	if data, err := os.ReadFile(statePath); err == nil {
-		themeID = strings.TrimSpace(string(data))
+	if themeID == "" {
+		if data, err := os.ReadFile(statePath); err == nil {
+			themeID = strings.TrimSpace(string(data))
+		}
 	}
 	if themeID != "" {
 		candidates := []string{

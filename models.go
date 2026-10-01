@@ -30,6 +30,55 @@ func valueText(value any) string {
 	}
 }
 
+func systemPruneReport(value any) string {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return valueText(value)
+	}
+	lines := []string{"System prune report"}
+	appendCount := func(label string, keys ...string) {
+		for _, key := range keys {
+			if raw, exists := object[key]; exists {
+				count := collectionCount(raw)
+				if count >= 0 {
+					lines = append(lines, fmt.Sprintf("%-18s %d", label, count))
+					return
+				}
+			}
+		}
+	}
+	appendCount("Containers removed", "ContainersDeleted", "ContainersPruned")
+	appendCount("Images removed", "ImagesDeleted", "ImagesPruned")
+	appendCount("Volumes removed", "VolumesDeleted", "VolumesPruned")
+	appendCount("Networks removed", "NetworksDeleted", "NetworksPruned")
+	if reclaimed, exists := object["SpaceReclaimed"]; exists {
+		lines = append(lines, fmt.Sprintf("%-18s %s", "Space reclaimed (SpaceReclaimed)", bytesText(reclaimed)))
+	}
+	if len(lines) == 1 {
+		return valueText(value)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func collectionCount(value any) int {
+	switch values := value.(type) {
+	case []any:
+		return len(values)
+	case []string:
+		return len(values)
+	case float64:
+		return int(values)
+	case int:
+		return values
+	case json.Number:
+		count, err := values.Int64()
+		if err == nil {
+			return int(count)
+		}
+	}
+	return -1
+}
+
 func firstName(value any) string {
 	if values, ok := value.([]any); ok && len(values) > 0 {
 		return fmt.Sprint(values[0])
@@ -364,24 +413,47 @@ func statsLinesForWidth(history []map[string]any, width int) []string {
 	}
 	latest := history[len(history)-1]
 	cpuValues, memoryValues := []float64{}, []float64{}
+	networkValues, blockValues := []float64{}, []float64{}
 	for _, sample := range history {
 		cpuValues = append(cpuValues, valueFor(sample, "CPU", "AvgCPU"))
 		memoryValues = append(memoryValues, valueFor(sample, "MemPerc", ""))
+		networkValues = append(networkValues, statsBytesValue(sample, "NetInput", "NetworkInput", "NetInputBytes")+statsBytesValue(sample, "NetOutput", "NetworkOutput", "NetOutputBytes"))
+		blockValues = append(blockValues, statsBytesValue(sample, "BlockInput", "BlockRead", "BlockInputBytes")+statsBytesValue(sample, "BlockOutput", "BlockWrite", "BlockOutputBytes"))
 	}
 	cpu, memory := cpuValues[len(cpuValues)-1], memoryValues[len(memoryValues)-1]
+	network, block := networkValues[len(networkValues)-1], blockValues[len(blockValues)-1]
 	graphWidth := max(20, min(56, width-8))
 	lines := []string{"Resource statistics", ""}
 	lines = append(lines, metricGraph("CPU (%)", cpu, cpuValues, graphWidth, 10)...)
 	lines = append(lines, "")
 	lines = append(lines, metricGraph("Memory (%)", memory, memoryValues, graphWidth, 10)...)
 	lines = append(lines, "")
+	lines = append(lines, metricGraph("Network I/O (bytes)", network, networkValues, graphWidth, 10)...)
+	lines = append(lines, "")
+	lines = append(lines, metricGraph("Block I/O (bytes)", block, blockValues, graphWidth, 10)...)
+	lines = append(lines, "")
 	return append(lines,
 		fmt.Sprintf("Memory    %s / %s", bytesText(latest["MemUsage"]), bytesText(latest["MemLimit"])),
 		fmt.Sprintf("PIDs      %d", int(numberValue(latest["PIDs"]))),
-		"Block I/O in   "+bytesText(latest["BlockInput"]),
-		"Block I/O out  "+bytesText(latest["BlockOutput"]), "",
+		"Network in    "+bytesText(statsBytesAny(latest, "NetInput", "NetworkInput", "NetInputBytes")),
+		"Network out   "+bytesText(statsBytesAny(latest, "NetOutput", "NetworkOutput", "NetOutputBytes")),
+		"Block I/O in  "+bytesText(statsBytesAny(latest, "BlockInput", "BlockRead", "BlockInputBytes")),
+		"Block I/O out "+bytesText(statsBytesAny(latest, "BlockOutput", "BlockWrite", "BlockOutputBytes")), "",
 		fmt.Sprintf("Samples: %d  ·  refresh interval: %gs", len(history), refreshInterval.Seconds()),
 	)
+}
+
+func statsBytesAny(sample map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := sample[key]; ok && value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func statsBytesValue(sample map[string]any, keys ...string) float64 {
+	return numberValue(statsBytesAny(sample, keys...))
 }
 
 // metricGraph delegates plotting to the same asciigraph library used by

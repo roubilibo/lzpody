@@ -20,6 +20,8 @@ type bubbleActionMsg struct {
 	itemID string
 	name   string
 	output string
+	config *UserConfig
+	batch  bool
 	err    error
 }
 
@@ -44,11 +46,15 @@ type Model struct {
 var _ tea.Model = Model{}
 
 func newBubbleModel(app *App) Model {
-	return Model{app: app, refreshAfter: refreshInterval}
+	refreshAfter := app.RefreshAfter
+	if refreshAfter <= 0 {
+		refreshAfter = refreshInterval
+	}
+	return Model{app: app, refreshAfter: refreshAfter}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.immediateRefreshCmd(), m.refreshCmd(), cursorBlinkCmd())
+	return tea.Batch(m.immediateRefreshCmd(), m.refreshCmd(), m.capabilitiesCmd(), cursorBlinkCmd())
 }
 
 func cursorBlinkCmd() tea.Cmd {
@@ -81,7 +87,7 @@ func (m Model) immediateRefreshCmdWithStatus(status string) tea.Cmd {
 
 func (m Model) detailCmd() tea.Cmd {
 	item := m.app.current()
-	if item == nil && m.app.DetailMode != "system" && m.app.DetailMode != "events" {
+	if item == nil && m.app.DetailMode != "system" && m.app.DetailMode != "storage" && m.app.DetailMode != "help" && m.app.DetailMode != "events" {
 		return nil
 	}
 	client := m.app.Client
@@ -91,10 +97,11 @@ func (m Model) detailCmd() tea.Cmd {
 	}
 	mode := m.app.DetailMode
 	history := append([]map[string]any(nil), m.app.StatsHistory[item.ID]...)
+	logFilter := m.app.LogFilter
 	m.app.DetailRequestID++
 	requestID := m.app.DetailRequestID
 	return func() tea.Msg {
-		result := fetchDetail(client, itemCopy, mode, history)
+		result := fetchDetail(client, itemCopy, mode, history, logFilter)
 		result.requestID = requestID
 		return bubbleDetailMsg{result: result}
 	}

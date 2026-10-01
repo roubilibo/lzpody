@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,10 +18,13 @@ type pullSession struct {
 	lines     []string
 	done      bool
 	err       error
+	cancel    context.CancelFunc
 }
 
 type pullStartedMsg struct {
 	session *pullSession
+	body    io.ReadCloser
+	scanner *bufio.Scanner
 	err     error
 }
 
@@ -31,16 +35,16 @@ type pullProgressMsg struct {
 	err     error
 }
 
-func (m Model) startPullCmd(reference string) tea.Cmd {
+func (m Model) startPullCmd(ctx context.Context, session *pullSession, reference string) tea.Cmd {
 	client := m.app.Client
 	return func() tea.Msg {
-		body, err := client.pullImageStream(reference)
+		body, err := client.pullImageStream(ctx, reference)
 		if err != nil {
-			return pullStartedMsg{err: err}
+			return pullStartedMsg{session: session, err: err}
 		}
 		scanner := bufio.NewScanner(body)
 		scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
-		return pullStartedMsg{session: &pullSession{body: body, scanner: scanner, reference: reference, lines: []string{"Pulling " + reference + "..."}}}
+		return pullStartedMsg{session: session, body: body, scanner: scanner}
 	}
 }
 

@@ -33,7 +33,7 @@ func layoutFor(width, height int) uiLayout {
 }
 
 func menuBounds(app *App, width, height int) (left, top, boxWidth, boxHeight, visibleStart int) {
-	entries := app.menuEntries()
+	entries := app.visibleMenuEntries()
 	boxWidth = min(42, max(24, width-6))
 	boxHeight = min(len(entries)+2, max(5, height-4))
 	top = max(1, (height-boxHeight)/2)
@@ -101,7 +101,7 @@ func (m Model) mouseMenu(event tea.MouseMsg) tea.Cmd {
 	}
 	row := event.Y - top - 1
 	visible := max(1, boxHeight-2)
-	entries := m.app.menuEntries()
+	entries := m.app.visibleMenuEntries()
 	if row >= 0 && row < visible && visibleStart+row < len(entries) {
 		m.app.MenuIndex = visibleStart + row
 		return m.executeMenuAction()

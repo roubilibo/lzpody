@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -51,21 +52,159 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.app.Status = "Shell exited."
 		}
 		return m, nil
+	case bubbleCapabilitiesMsg:
+		if msg.err == nil {
+			m.app.Capabilities = msg.capabilities
+			m.app.CapabilitiesSet = true
+		}
+		return m, nil
 	case pullStartedMsg:
+		if msg.session != nil && m.app.Pull != msg.session {
+			if msg.body != nil {
+				_ = msg.body.Close()
+			}
+			return m, nil
+		}
 		if msg.err != nil {
+			if msg.body != nil {
+				_ = msg.body.Close()
+			}
 			m.app.Pull = nil
 			m.app.PullOverlay = false
 			m.app.Status = msg.err.Error()
 			return m, nil
 		}
 		if m.app.Pull == nil || !m.app.PullOverlay {
-			_ = msg.session.body.Close()
+			if msg.body != nil {
+				_ = msg.body.Close()
+			}
 			return m, nil
 		}
+		msg.session.body = msg.body
+		msg.session.scanner = msg.scanner
 		m.app.Pull = msg.session
 		m.app.PullOverlay = true
 		m.app.Status = "Pulling " + msg.session.reference + "..."
 		return m, pullReadCmd(msg.session)
+	case operationStreamStartedMsg:
+		if m.app.Operation != msg.session {
+			if msg.body != nil {
+				_ = msg.body.Close()
+			}
+			return m, nil
+		}
+		if msg.err != nil {
+			m.finishOperation(msg.session, msg.err)
+			return m, nil
+		}
+		if msg.session.done {
+			_ = msg.body.Close()
+			return m, nil
+		}
+		msg.session.body = msg.body
+		msg.session.scanner = msg.scanner
+		return m, operationReadCmd(msg.session)
+	case operationProgressMsg:
+		if m.app.Operation != msg.session || msg.session.done {
+			return m, nil
+		}
+		if msg.line != "" {
+			msg.session.lines = appendOperationLines(msg.session.lines, msg.line)
+		}
+		if msg.done {
+			m.finishOperation(msg.session, msg.err)
+			if msg.session.err == nil && !msg.session.cancelRequested {
+				return m, m.immediateRefreshCmdWithStatus(msg.session.title + " complete")
+			}
+			return m, nil
+		}
+		return m, operationReadCmd(msg.session)
+	case statsStreamStartedMsg:
+		if m.app.StatsStream != msg.session {
+			if msg.body != nil {
+				_ = msg.body.Close()
+			}
+			return m, nil
+		}
+		if msg.err != nil {
+			m.app.stopStatsStream()
+			m.app.Status = "Live stats failed: " + msg.err.Error()
+			return m, nil
+		}
+		msg.session.body = msg.body
+		msg.session.scan = msg.scan
+		m.app.Status = "Live stats: " + msg.session.itemID
+		return m, statsStreamReadCmd(msg.session)
+	case statsStreamSampleMsg:
+		if m.app.StatsStream != msg.session {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.app.stopStatsStream()
+			m.app.Status = "Live stats failed: " + msg.err.Error()
+			return m, nil
+		}
+		if msg.done {
+			m.app.stopStatsStream()
+			m.app.Status = "Live stats ended."
+			return m, nil
+		}
+		if msg.sample != nil {
+			history := append(m.app.StatsHistory[msg.session.itemID], msg.sample)
+			if len(history) > 60 {
+				history = history[len(history)-60:]
+			}
+			m.app.StatsHistory[msg.session.itemID] = history
+			m.app.DetailRawLines = statsLines(history)
+			m.app.DetailLines = append([]string(nil), m.app.DetailRawLines...)
+			m.app.reflowDetail(m.app.DetailViewWidth)
+			m.app.Status = "Live stats: " + msg.session.itemID
+		}
+		return m, statsStreamReadCmd(msg.session)
+	case eventStreamStartedMsg:
+		if m.app.EventStream != msg.session {
+			if msg.body != nil {
+				_ = msg.body.Close()
+			}
+			return m, nil
+		}
+		if msg.err != nil {
+			m.app.stopEventStream()
+			m.app.Status = "Live events failed: " + msg.err.Error()
+			return m, nil
+		}
+		msg.session.body = msg.body
+		msg.session.scan = msg.scan
+		m.app.Status = "Live events connected"
+		return m, eventStreamReadCmd(msg.session)
+	case eventStreamLineMsg:
+		if m.app.EventStream != msg.session {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.app.stopEventStream()
+			m.app.Status = "Live events failed: " + msg.err.Error()
+			return m, nil
+		}
+		if msg.done {
+			m.app.stopEventStream()
+			m.app.Status = "Live events ended."
+			return m, nil
+		}
+		if msg.line != "" && (m.app.EventFilter == "" || strings.Contains(strings.ToLower(msg.line), strings.ToLower(m.app.EventFilter))) {
+			m.app.DetailRawLines = append(m.app.DetailRawLines, msg.line)
+			limit := m.app.Config.LogLimit
+			if limit <= 0 {
+				limit = 200
+			}
+			if len(m.app.DetailRawLines) > limit {
+				m.app.DetailRawLines = m.app.DetailRawLines[len(m.app.DetailRawLines)-limit:]
+			}
+			m.app.DetailLines = append([]string(nil), m.app.DetailRawLines...)
+			m.app.reflowDetail(m.app.DetailViewWidth)
+			m.app.DetailScroll = max(0, len(m.app.DetailLines)-max(1, m.app.DetailViewRows))
+		}
+		return m, eventStreamReadCmd(msg.session)
 	case pullProgressMsg:
 		if m.app.Pull != msg.session {
 			return m, nil
@@ -94,13 +233,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.app.Status = msg.statusOverride
 		}
 		if m.app.current() == nil {
-			if m.app.DetailMode != "system" && m.app.DetailMode != "events" {
+			if m.app.DetailMode != "system" && m.app.DetailMode != "storage" && m.app.DetailMode != "help" && m.app.DetailMode != "events" {
 				m.app.DetailLines = []string{"No item selected."}
 				m.app.DetailMode = "summary"
 			}
 		}
 		var detailCommand tea.Cmd
-		if len(m.app.DetailLines) == 0 || m.app.DetailMode == "logs" || m.app.DetailMode == "stats" || m.app.DetailMode == "top" || m.app.DetailMode == "events" || m.app.DetailMode == "system" || m.app.DetailMode == "history" {
+		if len(m.app.DetailLines) == 0 || m.app.DetailMode == "logs" || (m.app.DetailMode == "stats" && m.app.StatsStream == nil) || (m.app.DetailMode == "events" && m.app.EventStream == nil) || m.app.DetailMode == "top" || m.app.DetailMode == "system" || m.app.DetailMode == "storage" || m.app.DetailMode == "help" || m.app.DetailMode == "history" {
 			detailCommand = m.detailCmd()
 		}
 		return m, tea.Batch(detailCommand, m.refreshCmd())
@@ -113,6 +252,20 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.app.Status = msg.err.Error()
 			return m, nil
+		}
+		if msg.config != nil {
+			m.app.Config = *msg.config
+			m.app.RefreshAfter = msg.config.refreshDuration()
+			endpoint := msg.config.SocketPath
+			if msg.config.EndpointURL != "" {
+				endpoint = msg.config.EndpointURL
+			}
+			if endpoint != "" && endpoint != m.app.Client.SocketPath {
+				m.app.Client = NewPodmanClient(endpoint)
+			}
+		}
+		if msg.batch {
+			m.app.clearMarked()
 		}
 		if msg.output != "" {
 			m.app.DetailMode = "exec"
@@ -143,15 +296,44 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.immediateRefreshCmdWithStatus(status)
 	case tea.KeyMsg:
+		if (m.app.StatsStream != nil || m.app.EventStream != nil) && (msg.String() == "q" || msg.String() == "ctrl+c") {
+			m.app.stopLiveStreams()
+		}
 		if m.app.Shell != nil {
 			return m, m.updateShell(msg)
 		}
 		if m.app.Pull != nil {
 			if m.app.PullOverlay {
+				if !m.app.Pull.done {
+					if m.app.Pull.cancel != nil {
+						m.app.Pull.cancel()
+					}
+					if m.app.Pull.body != nil {
+						_ = m.app.Pull.body.Close()
+					}
+					m.app.Status = "Pull cancelled"
+				}
 				m.app.PullOverlay = false
 				m.app.Pull = nil
 				return m, nil
 			}
+		}
+		if m.app.Operation != nil {
+			if m.app.Operation.done {
+				m.app.Operation = nil
+				return m, nil
+			}
+			m.app.Operation.cancelRequested = true
+			if m.app.Operation.cancel != nil {
+				m.app.Operation.cancel()
+			}
+			if m.app.Operation.body != nil {
+				_ = m.app.Operation.body.Close()
+			}
+			m.app.Operation.lines = append(m.app.Operation.lines, "Cancellation requested.")
+			m.app.Operation.done = true
+			m.app.Status = m.app.Operation.title + " cancelled"
+			return m, nil
 		}
 		if m.app.Prompt != nil {
 			return m, m.updatePrompt(msg)
@@ -161,6 +343,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.app.FilterInput {
 			return m, m.updateFilter(msg)
+		}
+		if m.app.PaletteInput {
+			return m, m.updatePalette(msg)
 		}
 		if m.app.ConfirmAction != "" {
 			return m, m.updateConfirmation(msg)
@@ -225,6 +410,10 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 			m.app.DetailScroll = 0
 			return m.detailCmd()
 		}
+	case "space":
+		if !m.app.FocusMain {
+			m.app.toggleMarked()
+		}
 	case "pgup", "ctrl+u":
 		if m.app.FocusMain {
 			m.app.pageScroll(-1)
@@ -258,9 +447,7 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 		m.app.FocusMain = true
 		return m.detailCmd()
 	case "t":
-		m.app.DetailMode = "stats"
-		m.app.FocusMain = true
-		return m.detailCmd()
+		return m.startStatsCmd()
 	case "m":
 		if !m.app.FocusMain && m.app.Mode == "containers" {
 			m.app.DetailMode = "logs"
@@ -271,7 +458,13 @@ func (m Model) updateMain(message tea.KeyMsg) tea.Cmd {
 	case "f5":
 		return m.immediateRefreshCmd()
 	case "/":
-		if !m.app.FocusMain {
+		if m.app.FocusMain && (m.app.DetailMode == "logs" || m.app.DetailMode == "events") {
+			m.app.FilterInput = true
+			m.app.FilterDraft = m.app.LogFilter
+			if m.app.DetailMode == "events" {
+				m.app.FilterDraft = m.app.EventFilter
+			}
+		} else if !m.app.FocusMain {
 			m.app.FilterInput = true
 			m.app.FilterDraft = m.app.Filter
 		}
@@ -346,12 +539,46 @@ func (m Model) updateMenu(message tea.KeyMsg) tea.Cmd {
 		m.app.moveMenu(1)
 	case "enter", "space", "y", "Y":
 		return m.executeMenuAction()
+	case "/":
+		m.app.PaletteInput = true
+		m.app.FilterDraft = m.app.MenuFilter
+	}
+	return nil
+}
+
+func (m Model) updatePalette(message tea.KeyMsg) tea.Cmd {
+	switch message.String() {
+	case "esc", "ctrl+c":
+		m.app.PaletteInput = false
+		m.app.FilterDraft = ""
+	case "enter":
+		m.app.MenuFilter = strings.TrimSpace(m.app.FilterDraft)
+		m.app.PaletteInput = false
+		m.app.FilterDraft = ""
+		m.app.MenuIndex = 0
+		if entries := m.app.visibleMenuEntries(); len(entries) == 1 {
+			return m.executeMenuAction()
+		}
+	case "backspace", "delete":
+		if len(m.app.FilterDraft) > 0 {
+			runes := []rune(m.app.FilterDraft)
+			m.app.FilterDraft = string(runes[:len(runes)-1])
+		}
+	case "space", " ":
+		m.app.FilterDraft += " "
+	default:
+		if message.Type == tea.KeyRunes {
+			m.app.FilterDraft += string(message.Runes)
+		}
 	}
 	return nil
 }
 
 func (m Model) executeMenuAction() tea.Cmd {
 	action := m.app.selectedMenuAction()
+	if action != "stats" && action != "events" {
+		m.app.stopLiveStreams()
+	}
 	m.app.closeMenu()
 	switch action {
 	case "refresh":
@@ -362,7 +589,13 @@ func (m Model) executeMenuAction() tea.Cmd {
 		m.app.FocusMain = true
 		return m.detailCmd()
 	case "stats":
-		m.app.DetailMode = "stats"
+		return m.startStatsCmd()
+	case "help":
+		m.app.DetailMode = "help"
+		m.app.FocusMain = true
+		return m.detailCmd()
+	case "ports":
+		m.app.DetailMode = "ports"
 		m.app.FocusMain = true
 		return m.detailCmd()
 	case "env":
@@ -385,13 +618,22 @@ func (m Model) executeMenuAction() tea.Cmd {
 		m.app.DetailMode = "system"
 		m.app.FocusMain = true
 		return m.detailCmd()
-	case "events":
-		m.app.DetailMode = "events"
+	case "system_df":
+		m.app.DetailMode = "storage"
 		m.app.FocusMain = true
 		return m.detailCmd()
-	case "exec", "copy_to", "copy_from", "pull", "run", "build", "push", "image_tag", "image_search", "image_save", "image_load", "image_import", "registry_login", "registry_logout", "create_pod", "create_volume", "create_network", "create_secret", "network_connect", "network_disconnect", "prune_images", "prune_pods", "prune_volumes", "prune_networks", "system_prune":
+	case "events":
+		return m.startEventCmd()
+	case "exec", "copy_to", "copy_from", "pull", "run", "build", "push", "image_tag", "image_search", "image_save", "image_load", "image_import", "registry_login", "registry_logout", "create_pod", "create_volume", "create_network", "create_secret", "network_connect", "network_disconnect", "rename", "wait", "export", "checkpoint", "restore", "settings", "commit", "kube_play", "kube_down", "kube_generate", "manifest_create", "manifest_add", "manifest_push", "prune_images", "prune_pods", "prune_volumes", "prune_networks", "system_prune", "system_check":
 		m.app.beginPrompt(action)
 		return nil
+	case "batch_start", "batch_stop", "batch_remove":
+		if action == "batch_remove" {
+			return m.requestAction(action)
+		}
+		return m.batchActionCmd(action)
+	case "manifest_inspect":
+		return m.actionCmd(action)
 	case "image_untag":
 		return m.requestAction("image_untag")
 	case "volume_mount", "volume_unmount":
@@ -418,6 +660,12 @@ func (m Model) requestAction(action string) tea.Cmd {
 	if m.app.current() == nil {
 		return nil
 	}
+	if !m.app.Config.ConfirmDestructive {
+		if action == "batch_remove" {
+			return m.batchActionCmd(action)
+		}
+		return m.actionCmd(action)
+	}
 	m.app.ConfirmAction = action
 	return nil
 }
@@ -430,20 +678,85 @@ func (m Model) actionCmd(action string) tea.Cmd {
 	client := m.app.Client
 	itemCopy := *item
 	return func() tea.Msg {
+		message := bubbleActionMsg{action: action, itemID: itemCopy.ID, name: itemCopy.Name}
 		var err error
 		switch {
 		case itemCopy.Kind == "container":
-			err = client.resourceAction("containers", itemCopy.ID, action)
+			switch action {
+			case "init":
+				err = client.initContainer(itemCopy.ID)
+			case "healthcheck":
+				message.output, err = client.healthcheckContainer(itemCopy.ID)
+			case "diff":
+				var value any
+				value, err = client.containerChanges(itemCopy.ID)
+				if err == nil {
+					message.output = valueText(value)
+				}
+			case "mount":
+				message.output, err = client.mountContainer(itemCopy.ID)
+			case "unmount":
+				err = client.unmountContainer(itemCopy.ID)
+			case "commit":
+				err = fmt.Errorf("commit requires image repository input")
+			case "kube_generate":
+				err = fmt.Errorf("Kubernetes YAML generation requires input")
+			case "systemd":
+				message.output, err = client.generateSystemd(itemCopy.Kind, itemCopy.ID)
+			case "quadlet":
+				message.output, err = client.quadletFile(itemCopy.Kind, itemCopy.ID)
+			default:
+				err = client.resourceAction("containers", itemCopy.ID, action)
+			}
 		case itemCopy.Kind == "pod":
-			err = client.resourceAction("pods", itemCopy.ID, action)
+			if action == "systemd" || action == "quadlet" {
+				if action == "systemd" {
+					message.output, err = client.generateSystemd(itemCopy.Kind, itemCopy.ID)
+				} else {
+					message.output, err = client.quadletFile(itemCopy.Kind, itemCopy.ID)
+				}
+			} else {
+				err = client.resourceAction("pods", itemCopy.ID, action)
+			}
 		case itemCopy.Kind == "image" && action == "image_untag":
 			err = client.untagImage(itemCopy.ID)
+		case itemCopy.Kind == "image" && action == "manifest_inspect":
+			var value any
+			value, err = client.inspectManifest(itemCopy.ID)
+			if err == nil {
+				message.output = valueText(value)
+			}
 		case action == "remove":
 			err = client.remove(itemCopy.Kind+"s", itemCopy.ID)
 		default:
 			err = &PodmanError{Message: "Action \"" + action + "\" is not available for " + itemCopy.Kind + "."}
 		}
-		return bubbleActionMsg{action: action, itemID: itemCopy.ID, name: itemCopy.Name, err: err}
+		message.err = err
+		return message
+	}
+}
+
+func (m Model) batchActionCmd(action string) tea.Cmd {
+	items := append([]Item(nil), m.app.markedItems()...)
+	if len(items) == 0 {
+		m.app.Status = "Select at least one container or pod with Space first."
+		return nil
+	}
+	client := m.app.Client
+	mode := m.app.Mode
+	return func() tea.Msg {
+		for _, item := range items {
+			var err error
+			if action == "batch_remove" {
+				err = client.remove(item.Kind+"s", item.ID)
+			} else {
+				err = client.resourceAction(mode, item.ID, strings.TrimPrefix(action, "batch_"))
+			}
+			if err != nil {
+				return bubbleActionMsg{action: action, name: item.Name, batch: true, err: err}
+			}
+		}
+		return bubbleActionMsg{action: action, name: fmt.Sprintf("%d %s", len(items), mode), batch: true}
 	}
 }
 
@@ -452,6 +765,9 @@ func (m Model) updateConfirmation(message tea.KeyMsg) tea.Cmd {
 	case "y", "Y", "enter":
 		action := m.app.ConfirmAction
 		m.app.ConfirmAction = ""
+		if action == "batch_remove" {
+			return m.batchActionCmd(action)
+		}
 		if item := m.app.current(); item != nil {
 			m.app.Status = strings.Title(action) + " " + item.Name + "..."
 			return m.actionCmd(action)
@@ -465,6 +781,20 @@ func (m Model) updateConfirmation(message tea.KeyMsg) tea.Cmd {
 func (m Model) updateFilter(message tea.KeyMsg) tea.Cmd {
 	switch message.String() {
 	case "enter":
+		if (m.app.DetailMode == "logs" || m.app.DetailMode == "events") && m.app.FocusMain {
+			if m.app.DetailMode == "logs" {
+				m.app.LogFilter = strings.TrimSpace(m.app.FilterDraft)
+			} else {
+				m.app.EventFilter = strings.TrimSpace(m.app.FilterDraft)
+			}
+			m.app.FilterInput = false
+			m.app.DetailScroll = 0
+			m.app.LogsFollow = true
+			if m.app.DetailMode == "events" && m.app.EventStream != nil {
+				return m.startEventCmd()
+			}
+			return m.detailCmd()
+		}
 		m.app.Filter = strings.TrimSpace(m.app.FilterDraft)
 		m.app.FilterInput = false
 		m.app.Selected[m.app.Mode] = 0

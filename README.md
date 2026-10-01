@@ -2,8 +2,9 @@
 
 A small native Podman terminal UI inspired by lazydocker.
 
-The TUI talks to Podman's rootless **Libpod REST API** over the Unix socket.
-It does not invoke Docker CLI or require a Docker compatibility layer.
+The TUI talks directly to Podman's **Libpod REST API** over the rootless Unix
+socket or a configured HTTP(S) endpoint. It does not invoke Docker CLI or
+require a Docker compatibility layer.
 
 ## preview
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8edb4137-0715-4503-b35b-6286a63a96ad" />
@@ -24,8 +25,17 @@ https://github.com/user-attachments/assets/be54a50e-2339-49b2-852a-880f9aa18df1
   tag/untag, registry search, save/load/import, registry login/logout, creating and
   running containers, managing pods/volumes/networks, executing commands, and
   copying files.
-- System information and recent Podman events in the detail panel.
-- A single Go binary with no runtime dependencies beyond Podman and a Unix socket.
+- Long-running pull, build, push, and system-prune operations show progress in
+  the Bubble Tea UI and can be cancelled with `Esc`.
+- Container init/wait/rename/commit/export, rootfs mount, healthcheck,
+  filesystem diff, checkpoint/restore, Kubernetes YAML, systemd, and Quadlet.
+- Live stats and event streams with filtering, history graphs, multi-select, and
+  safe batch actions.
+- Kubernetes play/generate/down, image manifest workflows, storage usage, and
+  storage consistency checks.
+- Persistent settings for endpoint, refresh interval, theme, log limits, and
+  destructive-action confirmation.
+- A single Go binary with no runtime dependencies beyond Podman and its API.
 
 ## Run
 
@@ -71,6 +81,13 @@ Override it when needed:
 LZPODY_SOCKET=/path/to/podman.sock ./lzpody
 ```
 
+For a remote Podman service, use an HTTPS endpoint (or HTTP on a trusted
+network):
+
+```bash
+LZPODY_URL=https://podman.example.test ./lzpody
+```
+
 # lzpody — Keyboard Shortcuts
 
 ## 1. Navigation
@@ -110,6 +127,7 @@ or the detail view to open its resource-specific context menu.
 | `x` / `?` | Open action menu |
 | `↑` / `↓` | Navigate actions |
 | `j` / `k` | Navigate actions |
+| `/` | Search/filter actions in the command palette |
 | `Enter` / `Space` | Select an action |
 | `Esc` / `q` | Close action menu |
 
@@ -131,6 +149,7 @@ Container shortcuts follow LazyDocker conventions.
 | `i` | Config | Show container configuration |
 | `t` | Stats | Show container statistics |
 | `K` | Kill | Forcefully terminate a container |
+| `Space` | Mark | Select containers/pods for batch actions |
 
 ## 5. General Shortcuts
 
@@ -144,6 +163,9 @@ Container shortcuts follow LazyDocker conventions.
 | `C` | Create and run container |
 | `q` | Quit application |
 
+While a pull, build, push, or system-prune operation is running, press `Esc` to
+cancel it. After completion, press any key to close its report.
+
 ## 6. Libpod actions
 
 Open `x` or `?` for the complete action menu. Actions that need values open an
@@ -156,6 +178,7 @@ input overlay; use `|` to separate values:
 | Create secret | `secret-name`, then a local secret file path |
 | Build image | `context-directory \| image-tag` |
 | System prune | `YES \| all \| volumes \| build \| filters` (filters comma-separated, e.g. `until=24h,label=app=demo`) |
+| Storage check | `quick yes/no \| repair yes/no \| repair-lossy yes/no \| max age` |
 | Push image | `local-image \| registry-destination` |
 | Tag image | Select an image, then `repository \| tag` |
 | Search registry | `search-term \| limit` |
@@ -170,8 +193,13 @@ input overlay; use `|` to separate values:
 | Relationships | Select a container, pod, volume, or network and open `Relationships` to see links and usage |
 | Prune images | type `YES` |
 
-The menu also exposes volume mount/unmount, System info, and Events. Events are
-polled through the native Libpod API while the detail panel is open.
+The menu also exposes volume mount/unmount, System info, storage usage and
+consistency checks, Kubernetes actions, systemd/Quadlet generation, Settings,
+and Events. Stats and Events use native Libpod streaming endpoints while the
+detail panel is open.
+
+Settings are stored at `$XDG_CONFIG_HOME/lzpody/config.json`, or
+`~/.config/lzpody/config.json` when `XDG_CONFIG_HOME` is not set.
 
 ---
 

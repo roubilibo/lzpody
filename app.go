@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,48 +21,49 @@ var resourceLabels = map[string]string{
 }
 
 type App struct {
-	Client          *PodmanClient
-	Mode            string
-	Items           map[string][]Item
-	Selected        map[string]int
-	Marked          map[string]map[string]bool
-	DetailMode      string
-	DetailLines     []string
-	DetailRawLines  []string
-	StatsHistory    map[string][]map[string]any
-	StatsStream     *statsStreamSession
-	EventStream     *eventStreamSession
-	EventFilter     string
-	Filter          string
-	LogFilter       string
-	HideStopped     bool
-	Status          string
-	LastRefresh     time.Time
-	DetailScroll    int
-	DetailViewRows  int
-	DetailViewWidth int
-	DetailRequestID uint64
-	LogsFollow      bool
-	FocusMain       bool
-	MenuOpen        bool
-	MenuIndex       int
-	MenuFilter      string
-	PaletteInput    bool
-	Dirty           bool
-	ConfirmAction   string
-	FilterInput     bool
-	FilterDraft     string
-	Prompt          *promptState
-	ContainerForm   *containerFormState
-	CursorVisible   bool
-	Shell           *shellSession
-	Pull            *pullSession
-	PullOverlay     bool
-	Operation       *operationSession
-	Capabilities    PodmanCapabilities
-	CapabilitiesSet bool
-	Config          UserConfig
-	RefreshAfter    time.Duration
+	Client           *PodmanClient
+	Mode             string
+	Items            map[string][]Item
+	Selected         map[string]int
+	Marked           map[string]map[string]bool
+	DetailMode       string
+	DetailLines      []string
+	DetailRawLines   []string
+	StatsHistory     map[string][]map[string]any
+	StatsStream      *statsStreamSession
+	EventStream      *eventStreamSession
+	EventFilter      string
+	Filter           string
+	LogFilter        string
+	HideStopped      bool
+	Status           string
+	LastRefresh      time.Time
+	DetailScroll     int
+	DetailViewRows   int
+	DetailViewWidth  int
+	DetailRequestID  uint64
+	RefreshRequestID uint64
+	LogsFollow       bool
+	FocusMain        bool
+	MenuOpen         bool
+	MenuIndex        int
+	MenuFilter       string
+	PaletteInput     bool
+	Dirty            bool
+	ConfirmAction    string
+	FilterInput      bool
+	FilterDraft      string
+	Prompt           *promptState
+	ContainerForm    *containerFormState
+	CursorVisible    bool
+	Shell            *shellSession
+	Pull             *pullSession
+	PullOverlay      bool
+	Operation        *operationSession
+	Capabilities     PodmanCapabilities
+	CapabilitiesSet  bool
+	Config           UserConfig
+	RefreshAfter     time.Duration
 }
 
 type resourceSnapshot struct {
@@ -169,8 +171,25 @@ func fetchResourceSnapshot(client *PodmanClient, filter string, hideStopped bool
 	items := map[string][]Item{}
 	needle := strings.ToLower(filter)
 	var firstError error
-	for _, mode := range resourceModes {
-		raw, err := loaders[mode]()
+	type resourceListResult struct {
+		raw []map[string]any
+		err error
+	}
+	results := make([]resourceListResult, len(resourceModes))
+	semaphore := make(chan struct{}, 3)
+	var wait sync.WaitGroup
+	for index, mode := range resourceModes {
+		wait.Add(1)
+		go func(index int, mode string) {
+			defer wait.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			results[index].raw, results[index].err = loaders[mode]()
+		}(index, mode)
+	}
+	wait.Wait()
+	for index, mode := range resourceModes {
+		raw, err := results[index].raw, results[index].err
 		if err != nil {
 			if firstError == nil {
 				firstError = err
@@ -178,18 +197,24 @@ func fetchResourceSnapshot(client *PodmanClient, filter string, hideStopped bool
 			items[mode] = nil
 			continue
 		}
+		containerStats := map[string]float64{}
+		if mode == "containers" {
+			ids := make([]string, 0, len(raw))
+			for _, object := range raw {
+				item := containerItem(object)
+				if isRunning(item.State) && (needle == "" || strings.Contains(strings.ToLower(item.Name+" "+item.Image+" "+item.State), needle)) {
+					ids = append(ids, item.ID)
+				}
+			}
+			if len(ids) > 0 {
+				containerStats, _ = client.statsForContainers(ids)
+			}
+		}
 		converted := make([]Item, 0, len(raw))
 		for _, object := range raw {
 			item := converters[mode](object)
-			if mode == "containers" {
-				if sample, statsErr := client.stats(item.ID); statsErr == nil {
-					if payload := statsPayload(sample); payload != nil {
-						item.CPU = numberValue(payload["CPU"])
-						if item.CPU == 0 {
-							item.CPU = numberValue(payload["AvgCPU"])
-						}
-					}
-				}
+			if cpu, ok := containerStats[item.ID]; ok {
+				item.CPU = cpu
 			}
 			if hideStopped && mode == "containers" && !isRunning(item.State) {
 				continue
@@ -275,7 +300,18 @@ func fetchDetail(client *PodmanClient, item Item, mode string, history []map[str
 		result.lines = splitLines(valueText(value), "(no recent events)")
 		result.status = "Events"
 	case "summary":
-		result.lines = []string{fmt.Sprintf("Name:    %s", item.Name), fmt.Sprintf("ID:      %s", item.ID), fmt.Sprintf("State:   %s", item.State), fmt.Sprintf("Status:  %s", item.Status)}
+		switch item.Kind {
+		case "image":
+			result.lines = []string{fmt.Sprintf("Name:    %s", item.Name), fmt.Sprintf("ID:      %s", item.ID), fmt.Sprintf("Size:    %s", item.Status)}
+		case "pod":
+			result.lines = []string{fmt.Sprintf("Name:       %s", item.Name), fmt.Sprintf("ID:         %s", item.ID), fmt.Sprintf("State:      %s", item.State), fmt.Sprintf("Containers: %s", item.Status)}
+		case "volume":
+			result.lines = []string{fmt.Sprintf("Name:   %s", item.Name), fmt.Sprintf("Driver: %s", item.Status)}
+		case "network", "secret":
+			result.lines = []string{fmt.Sprintf("Name:   %s", item.Name), fmt.Sprintf("ID:     %s", item.ID), fmt.Sprintf("Driver: %s", item.Status)}
+		default:
+			result.lines = []string{fmt.Sprintf("Name:    %s", item.Name), fmt.Sprintf("ID:      %s", item.ID), fmt.Sprintf("State:   %s", item.State), fmt.Sprintf("Status:  %s", item.Status)}
+		}
 		if item.Kind == "container" {
 			health := item.Health
 			if inspected, err := client.inspect("containers", item.ID); err == nil {
@@ -559,6 +595,23 @@ func (a *App) reflowDetail(width int) {
 	}
 }
 
+func (a *App) setDetailViewport(width, height int) {
+	if width < 70 || height < 22 {
+		return
+	}
+	leftWidth := max(32, width/3)
+	rightWidth := width - (leftWidth + 2) - 1
+	detailWidth := rightWidth - 4
+	a.DetailViewWidth = detailWidth
+	a.DetailViewRows = max(1, height-7)
+	if item := a.current(); a.DetailMode == "stats" && item != nil {
+		if history := a.StatsHistory[item.ID]; len(history) > 0 {
+			a.DetailRawLines = statsLinesForWidth(history, detailWidth)
+		}
+	}
+	a.reflowDetail(detailWidth)
+}
+
 func (a *App) detailNeedsBottomSpacer() bool {
 	if a.DetailMode == "logs" || a.DetailMode == "system" {
 		return true
@@ -771,6 +824,19 @@ func (a *App) closeMenu() {
 
 func (a *App) visibleMenuEntries() [][2]string {
 	entries := a.menuEntries()
+	if a.CapabilitiesSet && (!a.Capabilities.SupportsSystemPrune || !a.Capabilities.SupportsSecrets) {
+		filtered := entries[:0]
+		for _, entry := range entries {
+			if entry[1] == "system_prune" && !a.Capabilities.SupportsSystemPrune {
+				continue
+			}
+			if entry[1] == "create_secret" && !a.Capabilities.SupportsSecrets {
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		entries = filtered
+	}
 	needle := strings.ToLower(strings.TrimSpace(a.MenuFilter))
 	if needle == "" {
 		return entries

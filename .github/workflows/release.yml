@@ -9,8 +9,24 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - name: Run Go checks
+        run: |
+          go test -race ./...
+          go vet ./...
+      - name: Test installer
+        run: sh tests/install_test.sh
+
   build:
     name: Build ${{ matrix.arch }}
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -50,6 +66,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Generate checksums
+        run: cd dist && sha256sum lzpody-linux-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/lzpody-linux-*
+          files: |
+            dist/lzpody-linux-*
+            dist/SHA256SUMS

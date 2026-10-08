@@ -45,6 +45,11 @@ type PodmanCapabilities struct {
 	SupportsSecrets     bool
 }
 
+const (
+	minimumSystemPruneMajorVersion = 1
+	minimumSecretsMajorVersion     = 3
+)
+
 type containerCreateOptions struct {
 	Image, Name, Command, Pod                            string
 	Ports, Environment, Mounts, Networks                 []string
@@ -354,6 +359,18 @@ func decodePodmanLogStream(value string) string {
 func (c *PodmanClient) stats(id string) (any, error) {
 	return c.get(c.APIRoot+"/containers/stats", url.Values{"containers": {id}, "stream": {"false"}})
 }
+
+func (c *PodmanClient) statsForContainers(ids []string) (map[string]float64, error) {
+	if len(ids) == 0 {
+		return map[string]float64{}, nil
+	}
+	value, err := c.get(c.APIRoot+"/containers/stats", url.Values{"containers": ids, "stream": {"false"}})
+	if err != nil {
+		return nil, err
+	}
+	return containerStatsByID(value, ids), nil
+}
+
 func (c *PodmanClient) podStats(id string) (any, error) {
 	return c.get(c.APIRoot+"/pods/stats", url.Values{"namesOrIDs": {id}, "all": {"true"}, "stream": {"false"}})
 }
@@ -1488,10 +1505,8 @@ func capabilitiesFromInfo(value any, apiRoot string) PodmanCapabilities {
 		apiVersion = strings.TrimPrefix(parts[0], "v")
 	}
 	capabilities := PodmanCapabilities{
-		APIRoot:             apiRoot,
-		APIVersion:          apiVersion,
-		SupportsSystemPrune: true,
-		SupportsSecrets:     true,
+		APIRoot:    apiRoot,
+		APIVersion: apiVersion,
 	}
 	object, ok := value.(map[string]any)
 	if !ok {
@@ -1511,7 +1526,32 @@ func capabilitiesFromInfo(value any, apiRoot string) PodmanCapabilities {
 			}
 		}
 	}
+	// Unknown versions remain unsupported rather than being optimistically
+	// advertised. Secrets require a newer server generation than system prune.
+	if major, ok := podmanMajorVersion(capabilities.LibpodVersion); ok {
+		capabilities.SupportsSystemPrune = major >= minimumSystemPruneMajorVersion
+		capabilities.SupportsSecrets = major >= minimumSecretsMajorVersion
+	}
 	return capabilities
+}
+
+func podmanMajorVersion(version string) (int, bool) {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return 0, false
+	}
+	if version[0] == 'v' || version[0] == 'V' {
+		version = version[1:]
+	}
+	end := 0
+	for end < len(version) && version[end] >= '0' && version[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	major, err := strconv.Atoi(version[:end])
+	return major, err == nil
 }
 
 func (c *PodmanClient) events(since time.Time) (any, error) {

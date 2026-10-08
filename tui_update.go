@@ -16,6 +16,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cursorBlinkCmd()
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.app.setDetailViewport(m.width, m.height)
 		m.resizeShell()
 		return m, nil
 	case shellStartedMsg:
@@ -223,7 +224,15 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.immediateRefreshCmdWithStatus(m.app.Status)
 		}
 		return m, pullReadCmd(msg.session)
+	case bubbleRefreshTickMsg:
+		return m, m.refreshSnapshotCmd("", true)
 	case bubbleRefreshMsg:
+		if msg.requestID != 0 && msg.requestID != m.app.RefreshRequestID {
+			if msg.periodic {
+				return m, m.refreshCmd()
+			}
+			return m, nil
+		}
 		keepID := ""
 		if item := m.app.current(); item != nil {
 			keepID = item.ID
@@ -242,7 +251,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.app.DetailLines) == 0 || m.app.DetailMode == "logs" || (m.app.DetailMode == "stats" && m.app.StatsStream == nil) || (m.app.DetailMode == "events" && m.app.EventStream == nil) || m.app.DetailMode == "top" || m.app.DetailMode == "system" || m.app.DetailMode == "storage" || m.app.DetailMode == "help" || m.app.DetailMode == "history" {
 			detailCommand = m.detailCmd()
 		}
-		return m, tea.Batch(detailCommand, m.refreshCmd())
+		if msg.periodic {
+			return m, tea.Batch(detailCommand, m.refreshCmd())
+		}
+		return m, detailCommand
 	case bubbleDetailMsg:
 		m.app.applyDetail(msg.result)
 		return m, nil

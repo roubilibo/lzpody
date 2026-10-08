@@ -122,6 +122,43 @@ func TestModelsAndStats(t *testing.T) {
 	}
 }
 
+func TestContainerStatsRowsPreferRequestedIDOverName(t *testing.T) {
+	rows := []any{map[string]any{"ID": "container-id", "Name": "worker", "CPU": 12.5}}
+	got := containerStatsByID(rows, []string{"container-id", "another-id"})
+	if got["container-id"] != 12.5 {
+		t.Fatalf("stats by container ID = %v, want 12.5", got)
+	}
+	if _, ok := got["worker"]; ok {
+		t.Fatalf("container name was incorrectly used as ID: %v", got)
+	}
+}
+
+func TestViewDoesNotMutateDetailState(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "demo"}}
+	app.DetailMode = "stats"
+	app.DetailRawLines = []string{"raw stats"}
+	app.DetailLines = []string{"existing display"}
+	app.DetailViewRows = 3
+	app.DetailViewWidth = 17
+	app.StatsHistory["c1"] = []map[string]any{{"CPU": 12.5}}
+
+	_ = app.frame(100, 30)
+
+	if fmt.Sprint(app.DetailRawLines) != "[raw stats]" || fmt.Sprint(app.DetailLines) != "[existing display]" || app.DetailViewRows != 3 || app.DetailViewWidth != 17 {
+		t.Fatalf("render mutated detail state: raw=%v lines=%v rows=%d width=%d", app.DetailRawLines, app.DetailLines, app.DetailViewRows, app.DetailViewWidth)
+	}
+}
+
+func TestWindowResizePreparesDetailViewport(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	model := newBubbleModel(app)
+	_, _ = model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	if app.DetailViewWidth != 60 || app.DetailViewRows != 23 {
+		t.Fatalf("detail viewport = %dx%d, want 60x23", app.DetailViewWidth, app.DetailViewRows)
+	}
+}
+
 func TestLifecycleQueries(t *testing.T) {
 	if got := lifecycleQuery("start"); got != nil {
 		t.Fatalf("start query = %v", got)
@@ -829,6 +866,60 @@ func TestRefreshDoesNotOverwriteLiveDetailStatus(t *testing.T) {
 	}
 }
 
+func TestResourceRefreshUsesOneBulkContainerStatsRequest(t *testing.T) {
+	statsRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v5.0.0/libpod/containers/json":
+			_, _ = w.Write([]byte(`[{"Id":"c1","Names":["/one"],"State":"running"},{"Id":"c2","Names":["/two"],"State":"exited"}]`))
+		case "/v5.0.0/libpod/containers/stats":
+			statsRequests++
+			if got := r.URL.Query()["containers"]; fmt.Sprint(got) != "[c1]" {
+				t.Errorf("bulk stats container IDs = %v, want [c1]", got)
+			}
+			_, _ = w.Write([]byte(`{"c1":{"CPU":12.5}}`))
+		case "/v5.0.0/libpod/pods/json", "/v5.0.0/libpod/images/json", "/v5.0.0/libpod/networks/json", "/v5.0.0/libpod/secrets/json":
+			_, _ = w.Write([]byte(`[]`))
+		case "/v5.0.0/libpod/volumes/json":
+			_, _ = w.Write([]byte(`{"Volumes":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	snapshot := fetchResourceSnapshot(NewPodmanClient(server.URL), "", false)
+	if snapshot.hasError {
+		t.Fatalf("resource refresh failed: %s", snapshot.status)
+	}
+	if statsRequests != 1 {
+		t.Fatalf("stats requests = %d, want one bulk request", statsRequests)
+	}
+	containers := snapshot.items["containers"]
+	if len(containers) != 2 || containers[0].CPU != 12.5 || containers[1].CPU != 0 {
+		t.Fatalf("container stats were not assigned correctly: %+v", containers)
+	}
+}
+
+func TestStaleRefreshResultIsIgnored(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.RefreshRequestID = 2
+	app.Status = "Current status"
+	app.Items["containers"] = []Item{{Kind: "container", ID: "c1", Name: "current"}}
+	model := newBubbleModel(app)
+	_, command := model.Update(bubbleRefreshMsg{
+		requestID: 1,
+		result: resourceSnapshot{
+			items:  map[string][]Item{"containers": {{Kind: "container", ID: "c2", Name: "stale"}}},
+			status: "stale snapshot",
+		},
+	})
+	if command != nil || app.Status != "Current status" || app.Items["containers"][0].ID != "c1" {
+		t.Fatalf("stale refresh changed model: status=%q items=%+v command=%v", app.Status, app.Items["containers"], command)
+	}
+}
+
 func TestBubbleTeaOwnsTerminalLifecycle(t *testing.T) {
 	model := newBubbleModel(NewApp(NewPodmanClient("/tmp/missing.sock")))
 	if model.width != 0 || model.height != 0 {
@@ -1318,6 +1409,37 @@ func TestCapabilitiesParsingSupportsLibpodInfoShapes(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesDoNotAdvertiseFeaturesForUnknownOrOldPodman(t *testing.T) {
+	for _, version := range []string{"", "unknown"} {
+		capabilities := capabilitiesFromInfo(map[string]any{"Version": version}, "/v5.0.0/libpod")
+		if capabilities.SupportsSystemPrune || capabilities.SupportsSecrets {
+			t.Errorf("unknown/old version %q advertised unsupported capabilities: %+v", version, capabilities)
+		}
+	}
+	old := capabilitiesFromInfo(map[string]any{"Version": "2.4.0"}, "/v5.0.0/libpod")
+	if !old.SupportsSystemPrune || old.SupportsSecrets {
+		t.Errorf("Podman 2.x capability detection = %+v", old)
+	}
+	capabilities := capabilitiesFromInfo(map[string]any{"Version": "v3.0.0-dev"}, "/v5.0.0/libpod")
+	if !capabilities.SupportsSystemPrune || !capabilities.SupportsSecrets {
+		t.Errorf("supported version capabilities = %+v", capabilities)
+	}
+}
+
+func TestMenuHidesActionsUnsupportedByDetectedPodmanVersion(t *testing.T) {
+	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
+	app.CapabilitiesSet = true
+	app.Capabilities = PodmanCapabilities{}
+	for _, mode := range []string{"containers", "secrets"} {
+		app.Mode = mode
+		for _, entry := range app.visibleMenuEntries() {
+			if entry[1] == "system_prune" || entry[1] == "create_secret" {
+				t.Fatalf("unsupported action %q shown in %s menu", entry[1], mode)
+			}
+		}
+	}
+}
+
 func TestOperationCancellationStaysInBubbleTeaState(t *testing.T) {
 	app := NewApp(NewPodmanClient("/tmp/unused-lzpody.sock"))
 	called := false
@@ -1418,5 +1540,14 @@ func TestPanelStyleDoesNotBleedIntoDetailText(t *testing.T) {
 	theme := loadUITheme()
 	if !strings.Contains(line, theme.Normal.Render(body)) {
 		t.Fatalf("detail body did not use the normal Lip Gloss style: %q", line)
+	}
+}
+
+func TestImageSummaryLabelsImageSize(t *testing.T) {
+	item := Item{Kind: "image", ID: "img1", Name: "mysql:8.4", State: "image", Status: "793.7 MiB"}
+	got := fetchDetail(NewPodmanClient("/tmp/unused-lzpody.sock"), item, "summary", nil, "")
+	want := []string{"Name:    mysql:8.4", "ID:      img1", "Size:    793.7 MiB", "", "Press x or ? to open available actions."}
+	if fmt.Sprint(got.lines) != fmt.Sprint(want) {
+		t.Fatalf("image summary = %q, want %q", got.lines, want)
 	}
 }

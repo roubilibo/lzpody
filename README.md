@@ -49,19 +49,32 @@ systemctl --user enable --now podman.socket
 From a source checkout, `./lzpody` uses `go run`; a release install executes
 the downloaded binary directly.
 
-Install to `~/.local/bin` with curl:
+Install the latest release to `~/.local/bin` with curl:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roubilibo/lzpody/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roubilibo/lzpody/master/install.sh | sh
 ```
 
-The installer is dependency-light: it downloads the platform binary and
-places it in `~/.local/bin`. Override the destination with `PREFIX` or
-`BIN_DIR`, and pin a release with `LZPODY_VERSION`.
+Run the same command again to update an existing installation. The installer
+verifies the release checksum and version, then replaces the installed binary
+atomically. It does not require root. Override the destination with `PREFIX`
+or `BIN_DIR`, and pin a release for install or update with `LZPODY_VERSION`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/roubilibo/lzpody/master/install.sh | LZPODY_VERSION=v1.2.3 sh
+```
+
+For development, clone the repository and run `./lzpody`; this uses `go run`
+when no local binary is present. This source-checkout launcher is separate from
+the installed release binary.
 
 For a fork or another release host, override the binary URL with
 `LZPODY_BINARY_URL` or its release directory with `LZPODY_RELEASE_BASE_URL`.
-The installer supports Linux `amd64`, `arm64`, and `armv7` builds.
+Release directories should publish both `SHA256SUMS` and the matching binary
+assets. When using a standalone `LZPODY_BINARY_URL`, also set
+`LZPODY_CHECKSUM_URL` to a manifest containing that asset; without it, the
+installer warns that the custom binary is not checksum-verified. The installer
+supports Linux `amd64`, `arm64`, and `armv7` builds.
 
 If the socket was enabled before but its file is missing, recover it with:
 
@@ -86,6 +99,13 @@ network):
 
 ```bash
 LZPODY_URL=https://podman.example.test ./lzpody
+```
+
+The client uses Libpod API `v5.0.0` by default. If the Podman service exposes a
+different compatible API version, override it explicitly:
+
+```bash
+LZPODY_API_VERSION=v4.0.0 ./lzpody
 ```
 
 # lzpody — Keyboard Shortcuts

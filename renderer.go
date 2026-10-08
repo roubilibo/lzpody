@@ -143,6 +143,25 @@ func menuEntryText(entry [2]string, width int) string {
 	return clip(shortcut, shortcutColumn) + clip(label, width-shortcutColumn)
 }
 
+func detailLinesForView(a *App, width int) []string {
+	if item := a.current(); a.DetailMode == "stats" && item != nil {
+		if history := a.StatsHistory[item.ID]; len(history) > 0 {
+			return statsLinesForWidth(history, width)
+		}
+	}
+	if a.DetailRawLines == nil {
+		return a.DetailLines
+	}
+	lines := append([]string(nil), a.DetailRawLines...)
+	if a.DetailMode == "logs" && width > 0 {
+		lines = wrapLines(lines, width)
+	}
+	if a.detailNeedsBottomSpacer() {
+		lines = append(lines, make([]string, logsBottomSpacer)...)
+	}
+	return lines
+}
+
 func (a *App) frame(width, height int) string {
 	uiTheme := loadUITheme(a.Config.Theme)
 	lines := make([]string, height)
@@ -277,16 +296,13 @@ func (a *App) frame(width, height int) string {
 		if item != nil {
 			title = item.Name
 		}
-		if a.DetailMode == "stats" && item != nil {
-			if history := a.StatsHistory[item.ID]; len(history) > 0 {
-				a.DetailRawLines = statsLinesForWidth(history, rightWidth-4)
-			}
-		}
+		detailLines := detailLinesForView(a, rightWidth-4)
+		detailScroll := min(a.DetailScroll, max(0, len(detailLines)-max(1, bottom-top-2)))
 		position := ""
-		if len(a.DetailLines) > 0 {
-			first := a.DetailScroll + 1
-			last := min(len(a.DetailLines), a.DetailScroll+max(1, bottom-top-2))
-			position = fmt.Sprintf("  (%d-%d/%d)", first, last, len(a.DetailLines))
+		if len(detailLines) > 0 {
+			first := detailScroll + 1
+			last := min(len(detailLines), detailScroll+max(1, bottom-top-2))
+			position = fmt.Sprintf("  (%d-%d/%d)", first, last, len(detailLines))
 		}
 		detailTitle := title + " [" + a.DetailMode + "]" + position
 		putLine(lines, top, rightX+2, rightWidth-4, detailTitle)
@@ -304,13 +320,11 @@ func (a *App) frame(width, height int) string {
 		putLine(lines, top+1, rightX+2, rightWidth-4, tabText)
 		addTextRegion(regions, top+1, rightX+2, rightWidth-4, tabText, uiTheme.Key)
 		detailRows := bottom - top - 2
-		a.DetailViewRows = max(1, detailRows)
-		a.reflowDetail(rightWidth - 4)
-		start := max(0, min(a.DetailScroll, max(0, len(a.DetailLines)-detailRows)))
-		statsGraphNumbers := make([]int, len(a.DetailLines))
+		start := max(0, min(detailScroll, max(0, len(detailLines)-detailRows)))
+		statsGraphNumbers := make([]int, len(detailLines))
 		if a.DetailMode == "stats" {
 			cpuCaption, memoryCaption := -1, -1
-			for lineIndex, line := range a.DetailLines {
+			for lineIndex, line := range detailLines {
 				if strings.Contains(line, "CPU (%)") {
 					cpuCaption = lineIndex
 				}
@@ -318,7 +332,7 @@ func (a *App) frame(width, height int) string {
 					memoryCaption = lineIndex
 				}
 			}
-			for lineIndex := range a.DetailLines {
+			for lineIndex := range detailLines {
 				if cpuCaption >= 2 && lineIndex >= 2 && lineIndex <= cpuCaption {
 					statsGraphNumbers[lineIndex] = 1
 				} else if memoryCaption > cpuCaption && lineIndex > cpuCaption && lineIndex <= memoryCaption {
@@ -328,7 +342,7 @@ func (a *App) frame(width, height int) string {
 		}
 		cpuGraphStyle := uiTheme.GraphCPU
 		memoryGraphStyle := uiTheme.GraphMemory
-		for index, line := range a.DetailLines[start:min(start+detailRows, len(a.DetailLines))] {
+		for index, line := range detailLines[start:min(start+detailRows, len(detailLines))] {
 			row := top + 2 + index
 			putLine(lines, row, rightX+2, rightWidth-4, line)
 			lineStyle := uiTheme.Normal

@@ -348,6 +348,83 @@ func statsPayload(value any) map[string]any {
 	return object
 }
 
+func containerStatsByID(value any, requestedIDs []string) map[string]float64 {
+	stats := make(map[string]float64)
+	requested := make(map[string]bool, len(requestedIDs))
+	for _, id := range requestedIDs {
+		requested[id] = true
+	}
+	add := func(id string, value any) {
+		if id == "" || !requested[id] {
+			return
+		}
+		sample := statsPayload(value)
+		if sample == nil {
+			return
+		}
+		cpu := numberValue(sample["CPU"])
+		if cpu == 0 {
+			cpu = numberValue(sample["AvgCPU"])
+		}
+		stats[id] = cpu
+	}
+	addRow := func(value any) {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return
+		}
+		id := ""
+		for _, key := range []string{"ContainerID", "container_id", "ID", "Id", "id", "containerId"} {
+			candidate := scalarText(object[key])
+			if requested[candidate] {
+				id = candidate
+				break
+			}
+		}
+		if id == "" {
+			for _, key := range []string{"Name", "name", "ContainerName", "container_name"} {
+				candidate := scalarText(object[key])
+				if requested[candidate] {
+					id = candidate
+					break
+				}
+			}
+		}
+		if id == "" && len(requestedIDs) == 1 {
+			id = requestedIDs[0]
+		}
+		add(id, object)
+	}
+	switch result := value.(type) {
+	case []any:
+		for _, entry := range result {
+			addRow(entry)
+		}
+	case map[string]any:
+		for key, entries := range result {
+			if strings.EqualFold(key, "Stats") {
+				if list, ok := entries.([]any); ok {
+					for _, entry := range list {
+						addRow(entry)
+					}
+					return stats
+				}
+			}
+		}
+		for key, entry := range result {
+			if requested[key] {
+				add(key, entry)
+				continue
+			}
+			addRow(entry)
+		}
+		if len(stats) == 0 && len(requestedIDs) == 1 {
+			add(requestedIDs[0], result)
+		}
+	}
+	return stats
+}
+
 var sparkChars = []rune("▁▂▃▄▅▆▇█")
 
 func gauge(value float64, width int) string {

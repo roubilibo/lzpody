@@ -9,7 +9,11 @@ import (
 type bubbleRefreshMsg struct {
 	result         resourceSnapshot
 	statusOverride string
+	requestID      uint64
+	periodic       bool
 }
+
+type bubbleRefreshTickMsg struct{}
 
 type bubbleDetailMsg struct {
 	result detailResult
@@ -64,11 +68,8 @@ func cursorBlinkCmd() tea.Cmd {
 }
 
 func (m Model) refreshCmd() tea.Cmd {
-	client := m.app.Client
-	filter := m.app.Filter
-	hideStopped := m.app.HideStopped
 	return tea.Tick(m.refreshAfter, func(time.Time) tea.Msg {
-		return bubbleRefreshMsg{result: fetchResourceSnapshot(client, filter, hideStopped)}
+		return bubbleRefreshTickMsg{}
 	})
 }
 
@@ -77,11 +78,17 @@ func (m Model) immediateRefreshCmd() tea.Cmd {
 }
 
 func (m Model) immediateRefreshCmdWithStatus(status string) tea.Cmd {
+	return m.refreshSnapshotCmd(status, false)
+}
+
+func (m Model) refreshSnapshotCmd(status string, periodic bool) tea.Cmd {
 	client := m.app.Client
 	filter := m.app.Filter
 	hideStopped := m.app.HideStopped
+	m.app.RefreshRequestID++
+	requestID := m.app.RefreshRequestID
 	return func() tea.Msg {
-		return bubbleRefreshMsg{result: fetchResourceSnapshot(client, filter, hideStopped), statusOverride: status}
+		return bubbleRefreshMsg{result: fetchResourceSnapshot(client, filter, hideStopped), statusOverride: status, requestID: requestID, periodic: periodic}
 	}
 }
 

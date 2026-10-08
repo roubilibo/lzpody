@@ -176,14 +176,8 @@ func (a *App) frame(width, height int) string {
 		return frameText(lines, styles, regions)
 	}
 	headerTitle := " lzpody "
-	headerSubtitle := "native Libpod · " + uiTheme.Name
-	if a.CapabilitiesSet && a.Capabilities.LibpodVersion != "" {
-		headerSubtitle = "native Libpod " + a.Capabilities.LibpodVersion + " · " + uiTheme.Name
-	}
 	putLine(lines, 0, 0, width, headerTitle)
-	putLine(lines, 0, 14, width-14, headerSubtitle)
 	addTextRegion(regions, 0, 0, width, headerTitle, uiTheme.Title)
-	addTextRegion(regions, 0, 14, width-14, headerSubtitle, uiTheme.Muted)
 	refreshText := "[F5] refresh  [q] quit"
 	refreshColumn := max(1, width-25)
 	putLine(lines, 1, refreshColumn, width-refreshColumn, refreshText)
@@ -402,8 +396,13 @@ func (a *App) frame(width, height int) string {
 	if a.ContainerForm != nil {
 		footer = "Tab/Enter next  [ / ] tabs  Ctrl+S create  Esc cancel"
 	}
-	putLine(lines, height-1, 1, width-2, footer)
-	addTextRegion(regions, height-1, 1, width-2, footer, uiTheme.Key)
+	versionLabel := "lzpody " + version
+	versionColumn := max(1, width-1-len(versionLabel))
+	footerWidth := max(0, versionColumn-3)
+	putLine(lines, height-1, 1, footerWidth, footer)
+	addTextRegion(regions, height-1, 1, footerWidth, footer, uiTheme.Key)
+	putLine(lines, height-1, versionColumn, len(versionLabel), versionLabel)
+	addTextRegion(regions, height-1, versionColumn, len(versionLabel), versionLabel, uiTheme.Muted)
 	if a.MenuOpen {
 		entries := a.visibleMenuEntries()
 		boxWidth := min(42, max(24, width-6))
@@ -450,7 +449,9 @@ func (a *App) frame(width, height int) string {
 		putLine(lines, height-2, 1, width-2, paletteText)
 		addTextRegion(regions, height-2, 1, width-2, paletteText, uiTheme.Normal.Bold(true))
 	}
-	if a.ConfirmAction != "" {
+	if a.UpdateConfirm {
+		drawUpdateConfirmOverlay(lines, regions, width, height, uiTheme, a.UpdateRelease)
+	} else if a.ConfirmAction != "" {
 		drawConfirmOverlay(lines, styles, regions, width, height, uiTheme, a)
 	}
 	if a.Prompt != nil {
@@ -664,6 +665,35 @@ func drawPromptOverlay(lines []string, styles []lipgloss.Style, regions [][]text
 	controlText := centeredLine(controls, innerWidth)
 	putLine(lines, top+6, left, boxWidth, "│"+controlText+"│")
 	addTextRegion(regions, top+6, left+1, innerWidth, controlText, theme.KeySelected)
+}
+
+func drawUpdateConfirmOverlay(lines []string, regions [][]textRegion, width, height int, theme UITheme, release *updateRelease) {
+	if release == nil {
+		return
+	}
+	prompt := "Install lzpody " + release.TagName + "?"
+	boxWidth := min(max(46, len([]rune(prompt))+8), max(46, width-6))
+	boxHeight := min(7, max(5, height-2))
+	top := max(1, (height-boxHeight)/2)
+	left := max(2, (width-boxWidth)/2)
+	putLine(lines, top, left, boxWidth, titledBoxLine(boxWidth, "Update available"))
+	addRegion(regions, top, left, left+boxWidth, theme.Title)
+	for row := top + 1; row < top+boxHeight-1; row++ {
+		putLine(lines, row, left, boxWidth, "│"+strings.Repeat(" ", boxWidth-2)+"│")
+		addRegion(regions, row, left+1, left+boxWidth-1, theme.Normal)
+	}
+	putLine(lines, top+boxHeight-1, left, boxWidth, boxLine(boxWidth, '└', '┘'))
+	addRegion(regions, top+boxHeight-1, left, left+boxWidth, theme.Title)
+	innerWidth := boxWidth - 2
+	message := centeredLine(prompt, innerWidth)
+	putLine(lines, top+2, left+1, innerWidth, message)
+	addTextRegion(regions, top+2, left+1, innerWidth, message, theme.Selected.Bold(true))
+	restart := centeredLine("Restart lzpody after updating.", innerWidth)
+	putLine(lines, top+3, left+1, innerWidth, restart)
+	addTextRegion(regions, top+3, left+1, innerWidth, restart, theme.Normal)
+	controls := centeredLine("Y/Enter update   N/Esc cancel", innerWidth)
+	putLine(lines, top+5, left+1, innerWidth, controls)
+	addTextRegion(regions, top+5, left+1, innerWidth, controls, theme.KeySelected)
 }
 
 func drawConfirmOverlay(lines []string, styles []lipgloss.Style, regions [][]textRegion, width, height int, theme UITheme, app *App) {

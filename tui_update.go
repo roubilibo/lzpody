@@ -59,6 +59,21 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.app.CapabilitiesSet = true
 		}
 		return m, nil
+	case updateCheckMsg:
+		applyUpdateCheck(m.app, msg)
+		return m, nil
+	case updateInstallMsg:
+		m.app.UpdateChecking = false
+		m.app.UpdateInProgress = false
+		m.app.UpdateConfirm = false
+		m.app.UpdateRelease = nil
+		m.app.UpdateTarget = ""
+		if msg.err != nil {
+			m.app.Status = "Update failed: " + msg.err.Error()
+		} else {
+			m.app.Status = "Updated to " + msg.tag + ". Restart lzpody to use the new version."
+		}
+		return m, nil
 	case pullStartedMsg:
 		if msg.session != nil && m.app.Pull != msg.session {
 			if msg.body != nil {
@@ -259,6 +274,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.app.applyDetail(msg.result)
 		return m, nil
 	case tea.MouseMsg:
+		if m.app.UpdateInProgress {
+			return m, nil
+		}
 		return m, m.mouseUpdate(msg)
 	case bubbleActionMsg:
 		if msg.err != nil {
@@ -314,6 +332,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.app.Shell != nil {
 			return m, m.updateShell(msg)
 		}
+		if m.app.UpdateInProgress {
+			return m, nil
+		}
 		if m.app.Pull != nil {
 			if m.app.PullOverlay {
 				if !m.app.Pull.done {
@@ -358,6 +379,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.app.PaletteInput {
 			return m, m.updatePalette(msg)
+		}
+		if m.app.UpdateConfirm {
+			return m, m.updateSelfConfirmation(msg)
 		}
 		if m.app.ConfirmAction != "" {
 			return m, m.updateConfirmation(msg)
@@ -588,13 +612,15 @@ func (m Model) updatePalette(message tea.KeyMsg) tea.Cmd {
 
 func (m Model) executeMenuAction() tea.Cmd {
 	action := m.app.selectedMenuAction()
-	if action != "stats" && action != "events" {
+	if action != "stats" && action != "events" && action != "check_updates" {
 		m.app.stopLiveStreams()
 	}
 	m.app.closeMenu()
 	switch action {
 	case "refresh":
 		return m.immediateRefreshCmd()
+	case "check_updates":
+		return m.checkForUpdatesCmd()
 	case "logs":
 		m.app.DetailMode = "logs"
 		m.app.LogsFollow = true

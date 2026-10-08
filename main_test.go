@@ -1295,10 +1295,13 @@ func TestBubbleTeaViewIncludesNativeLayoutAndConfirmation(t *testing.T) {
 	app.DetailLines = []string{"Name:    demo", "State:   running"}
 	app.ConfirmAction = "stop"
 	view := (bubbleModel{app: app, width: 100, height: 30}).View()
-	for _, want := range []string{"native Libpod", "Confirm action", "Stop demo?", "Y/Enter confirm"} {
+	for _, want := range []string{"lzpody dev", "Confirm action", "Stop demo?", "Y/Enter confirm"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("Bubble Tea view does not contain %q", want)
 		}
+	}
+	if strings.Contains(view, "native Libpod") {
+		t.Fatal("header includes verbose Podman metadata")
 	}
 }
 

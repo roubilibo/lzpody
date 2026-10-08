@@ -44,7 +44,7 @@ func menuBounds(app *App, width, height int) (left, top, boxWidth, boxHeight, vi
 }
 
 func (m Model) mouseUpdate(event tea.MouseMsg) tea.Cmd {
-	if m.app.Prompt != nil || m.app.ContainerForm != nil || m.app.ConfirmAction != "" {
+	if m.app.Prompt != nil || m.app.ContainerForm != nil || m.app.ConfirmAction != "" || m.app.UpdateConfirm {
 		return nil
 	}
 	if m.app.MenuOpen {

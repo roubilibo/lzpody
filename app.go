@@ -51,6 +51,11 @@ type App struct {
 	PaletteInput     bool
 	Dirty            bool
 	ConfirmAction    string
+	UpdateRelease    *updateRelease
+	UpdateTarget     string
+	UpdateConfirm    bool
+	UpdateChecking   bool
+	UpdateInProgress bool
 	FilterInput      bool
 	FilterDraft      string
 	Prompt           *promptState
@@ -251,7 +256,7 @@ func (a *App) applyRefresh(result resourceSnapshot, keepID string) {
 		}
 	}
 	a.LastRefresh = result.lastRefresh
-	if a.Operation == nil && (result.hasError || (a.DetailMode != "logs" && a.DetailMode != "stats" && a.DetailMode != "top" && a.DetailMode != "system" && a.DetailMode != "storage" && a.DetailMode != "help" && a.DetailMode != "events" && a.DetailMode != "exec" && a.DetailMode != "shell" && a.DetailMode != "pull" && a.DetailMode != "relationships")) {
+	if a.Operation == nil && !a.UpdateChecking && !a.UpdateConfirm && !a.UpdateInProgress && (result.hasError || (a.DetailMode != "logs" && a.DetailMode != "stats" && a.DetailMode != "top" && a.DetailMode != "system" && a.DetailMode != "storage" && a.DetailMode != "help" && a.DetailMode != "events" && a.DetailMode != "exec" && a.DetailMode != "shell" && a.DetailMode != "pull" && a.DetailMode != "relationships")) {
 		a.Status = result.status
 	}
 	a.Dirty = true
@@ -806,7 +811,7 @@ func actionsForMode(mode string) [][2]string {
 }
 
 func panelUtilityActions() [][2]string {
-	return [][2]string{{"Refresh", "refresh"}, {"Batch start", "batch_start"}, {"Batch stop", "batch_stop"}, {"Batch remove", "batch_remove"}, {"System info", "system_info"}, {"Storage usage", "system_df"}, {"Storage check", "system_check"}, {"Kube play", "kube_play"}, {"Kube down", "kube_down"}, {"Help", "help"}, {"Settings", "settings"}, {"Events", "events"}, {"System prune", "system_prune"}}
+	return [][2]string{{"Refresh", "refresh"}, {"Batch start", "batch_start"}, {"Batch stop", "batch_stop"}, {"Batch remove", "batch_remove"}, {"System info", "system_info"}, {"Storage usage", "system_df"}, {"Storage check", "system_check"}, {"Kube play", "kube_play"}, {"Kube down", "kube_down"}, {"Check for updates", "check_updates"}, {"Help", "help"}, {"Settings", "settings"}, {"Events", "events"}, {"System prune", "system_prune"}}
 }
 
 func (a *App) openMenu() {
@@ -824,6 +829,15 @@ func (a *App) closeMenu() {
 
 func (a *App) visibleMenuEntries() [][2]string {
 	entries := a.menuEntries()
+	if version == "dev" {
+		filtered := entries[:0]
+		for _, entry := range entries {
+			if entry[1] != "check_updates" {
+				filtered = append(filtered, entry)
+			}
+		}
+		entries = filtered
+	}
 	if a.CapabilitiesSet && (!a.Capabilities.SupportsSystemPrune || !a.Capabilities.SupportsSecrets) {
 		filtered := entries[:0]
 		for _, entry := range entries {

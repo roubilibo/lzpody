@@ -64,6 +64,12 @@ or `BIN_DIR`, and pin a release for install or update with `LZPODY_VERSION`:
 curl -fsSL https://raw.githubusercontent.com/roubilibo/lzpody/master/install.sh | LZPODY_VERSION=v1.2.3 sh
 ```
 
+Release binaries can also check for and install updates from the TUI: open the
+action menu (`x` or `?`) and choose **Check for updates**. The update is
+verified before replacing the current binary; restart lzpody afterward. This
+option is unavailable for development builds and binaries in unwritable
+locations.
+
 For development, clone the repository and run `./lzpody`; this uses `go run`
 when no local binary is present. This source-checkout launcher is separate from
 the installed release binary.

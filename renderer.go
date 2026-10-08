@@ -153,7 +153,7 @@ func detailLinesForView(a *App, width int) []string {
 		return a.DetailLines
 	}
 	lines := append([]string(nil), a.DetailRawLines...)
-	if a.DetailMode == "logs" && width > 0 {
+	if a.detailNeedsWrap() && width > 0 {
 		lines = wrapLines(lines, width)
 	}
 	if a.detailNeedsBottomSpacer() {

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -311,8 +312,10 @@ func fetchDetail(client *PodmanClient, item Item, mode string, history []map[str
 		case "pod":
 			result.lines = []string{fmt.Sprintf("Name:       %s", item.Name), fmt.Sprintf("ID:         %s", item.ID), fmt.Sprintf("State:      %s", item.State), fmt.Sprintf("Containers: %s", item.Status)}
 		case "volume":
-			result.lines = []string{fmt.Sprintf("Name:   %s", item.Name), fmt.Sprintf("Driver: %s", item.Status)}
-		case "network", "secret":
+			result.lines = volumeSummaryLines(item, inspectSummaryDetails(client, item))
+		case "network":
+			result.lines = networkSummaryLines(item, inspectSummaryDetails(client, item))
+		case "secret":
 			result.lines = []string{fmt.Sprintf("Name:   %s", item.Name), fmt.Sprintf("ID:     %s", item.ID), fmt.Sprintf("Driver: %s", item.Status)}
 		default:
 			result.lines = []string{fmt.Sprintf("Name:    %s", item.Name), fmt.Sprintf("ID:      %s", item.ID), fmt.Sprintf("State:   %s", item.State), fmt.Sprintf("Status:  %s", item.Status)}
@@ -503,6 +506,259 @@ func inspectItem(client *PodmanClient, item Item) (any, error) {
 	return client.inspect(item.Kind+"s", item.ID)
 }
 
+func inspectSummaryDetails(client *PodmanClient, item Item) map[string]any {
+	details := map[string]any{}
+	for key, value := range item.Details {
+		details[key] = value
+	}
+	if inspected, err := inspectItem(client, item); err == nil {
+		switch value := inspected.(type) {
+		case map[string]any:
+			for key, field := range value {
+				details[key] = field
+			}
+		case []any:
+			if len(value) > 0 {
+				if object, ok := value[0].(map[string]any); ok {
+					for key, field := range object {
+						details[key] = field
+					}
+				}
+			}
+		}
+	}
+	return details
+}
+
+func volumeSummaryLines(item Item, details map[string]any) []string {
+	name := summaryText(details, "Name")
+	if name == "" {
+		name = item.Name
+	}
+	driver := summaryText(details, "Driver")
+	if driver == "" {
+		driver = defaultText(item.Status, "local")
+	}
+	lines := []string{fmt.Sprintf("Name:       %s", name), fmt.Sprintf("Driver:     %s", driver)}
+	appendSummaryField(&lines, details, "Scope", "Scope")
+	appendSummaryField(&lines, details, "Created", "CreatedAt", "Created")
+	appendSummaryField(&lines, details, "Mountpoint", "Mountpoint", "MountPoint")
+	appendSummaryField(&lines, details, "Mount Count", "MountCount", "Mount Count")
+	appendSummaryMap(&lines, details, "Labels", "Labels")
+	appendSummaryMap(&lines, details, "Options", "Options")
+	return lines
+}
+
+func networkSummaryLines(item Item, details map[string]any) []string {
+	name := summaryText(details, "Name")
+	if name == "" {
+		name = item.Name
+	}
+	id := summaryText(details, "ID", "Id")
+	if id == "" {
+		id = item.ID
+	}
+	driver := summaryText(details, "Driver")
+	if driver == "" {
+		driver = defaultText(item.Status, "bridge")
+	}
+	lines := []string{fmt.Sprintf("Name:       %s", name), fmt.Sprintf("ID:         %s", id), fmt.Sprintf("Driver:     %s", driver)}
+	appendSummaryField(&lines, details, "Created", "Created", "CreatedAt")
+	appendSummaryField(&lines, details, "Interface", "NetworkInterface", "NetworkInterfaceName", "Interface")
+	subnetValue, _ := summaryValue(details, "Subnets", "Subnet")
+	if subnets := networkSubnetSummary(subnetValue); len(subnets) > 0 {
+		lines = append(lines, "Subnets:")
+		for _, subnet := range subnets {
+			lines = append(lines, "  "+subnet)
+		}
+	}
+	appendSummaryField(&lines, details, "IPv6", "IPv6Enabled", "IPv6")
+	appendSummaryField(&lines, details, "Internal", "Internal")
+	appendSummaryField(&lines, details, "DNS enabled", "DNSEnabled", "DNS")
+	if rawContainers, ok := summaryValue(details, "Containers"); ok {
+		containers := networkContainerSummary(rawContainers)
+		lines = append(lines, fmt.Sprintf("Connected containers (%d):", len(containers)))
+		for _, container := range containers {
+			lines = append(lines, "  "+container)
+		}
+	}
+	appendSummaryMap(&lines, details, "Labels", "Labels")
+	return lines
+}
+
+func summaryValue(details map[string]any, names ...string) (any, bool) {
+	for _, name := range names {
+		if value, ok := details[name]; ok && value != nil {
+			return value, true
+		}
+	}
+	keys := make([]string, 0, len(details))
+	for key := range details {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, name := range names {
+		wanted := summaryKey(name)
+		for _, key := range keys {
+			if value := details[key]; summaryKey(key) == wanted && value != nil {
+				return value, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func summaryKey(key string) string {
+	key = strings.ToLower(key)
+	key = strings.ReplaceAll(key, "_", "")
+	key = strings.ReplaceAll(key, "-", "")
+	key = strings.ReplaceAll(key, " ", "")
+	return key
+}
+
+func summaryText(details map[string]any, names ...string) string {
+	value, ok := summaryValue(details, names...)
+	if !ok || value == nil {
+		return ""
+	}
+	return scalarText(value)
+}
+
+func appendSummaryField(lines *[]string, details map[string]any, label string, names ...string) {
+	value, ok := summaryValue(details, names...)
+	if !ok || value == nil {
+		return
+	}
+	text := scalarText(value)
+	if text == "" || text == "<nil>" {
+		return
+	}
+	*lines = append(*lines, fmt.Sprintf("%s: %s", label, text))
+}
+
+func appendSummaryMap(lines *[]string, details map[string]any, label string, names ...string) {
+	value, ok := summaryValue(details, names...)
+	if !ok {
+		return
+	}
+	entries := summaryMapEntries(value)
+	if len(entries) > 0 {
+		*lines = append(*lines, label+": "+strings.Join(entries, ", "))
+	}
+}
+
+func summaryMapEntries(value any) []string {
+	entries := map[string]string{}
+	switch object := value.(type) {
+	case map[string]any:
+		for key, item := range object {
+			if item != nil && scalarText(item) != "" {
+				entries[key] = scalarText(item)
+			}
+		}
+	case map[string]string:
+		for key, item := range object {
+			if item != "" {
+				entries[key] = item
+			}
+		}
+	}
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, key+"="+entries[key])
+	}
+	return result
+}
+
+func networkSubnetSummary(value any) []string {
+	var objects []map[string]any
+	switch subnets := value.(type) {
+	case []any:
+		for _, subnet := range subnets {
+			if object, ok := subnet.(map[string]any); ok {
+				objects = append(objects, object)
+			}
+		}
+	case map[string]any:
+		objects = append(objects, subnets)
+	case string:
+		if strings.TrimSpace(subnets) != "" {
+			return []string{subnets}
+		}
+	}
+	result := make([]string, 0, len(objects))
+	for _, object := range objects {
+		subnet := summaryText(object, "Subnet", "CIDR")
+		gateway := summaryText(object, "Gateway")
+		if subnet == "" && gateway == "" {
+			continue
+		}
+		if subnet != "" && gateway != "" {
+			result = append(result, subnet+" · gateway "+gateway)
+		} else if subnet != "" {
+			result = append(result, subnet)
+		} else {
+			result = append(result, "gateway "+gateway)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func networkContainerSummary(value any) []string {
+	result := []string{}
+	appendContainer := func(fallback string, item any) {
+		name := fallback
+		addresses := []string{}
+		if object, ok := item.(map[string]any); ok {
+			if value := summaryText(object, "Name"); value != "" {
+				name = value
+			} else if id := summaryText(object, "ID", "Id", "ContainerID"); id != "" {
+				name = id
+			}
+			if address := summaryText(object, "IPv4Address", "IPv4"); address != "" {
+				addresses = append(addresses, address)
+			}
+			if address := summaryText(object, "IPv6Address", "IPv6"); address != "" {
+				addresses = append(addresses, address)
+			}
+		}
+		if name == "" {
+			return
+		}
+		if len(addresses) > 0 {
+			name += " · " + strings.Join(addresses, ", ")
+		}
+		result = append(result, name)
+	}
+	switch containers := value.(type) {
+	case map[string]any:
+		ids := make([]string, 0, len(containers))
+		for id := range containers {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			fallback := id
+			if len(fallback) > 12 {
+				fallback = fallback[:12]
+			}
+			appendContainer(fallback, containers[id])
+		}
+	case []any:
+		for _, item := range containers {
+			appendContainer("", item)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
 func relationshipLines(kind string, value any) []string {
 	object, ok := value.(map[string]any)
 	if !ok {
@@ -585,7 +841,7 @@ func (a *App) reflowDetail(width int) {
 		return
 	}
 	lines := append([]string(nil), a.DetailRawLines...)
-	if a.DetailMode == "logs" && a.DetailViewWidth > 0 {
+	if a.detailNeedsWrap() && a.DetailViewWidth > 0 {
 		lines = wrapLines(lines, a.DetailViewWidth)
 	}
 	if a.detailNeedsBottomSpacer() {
@@ -626,6 +882,17 @@ func (a *App) detailNeedsBottomSpacer() bool {
 		return item != nil && item.Kind == "container"
 	}
 	return false
+}
+
+func (a *App) detailNeedsWrap() bool {
+	if a.DetailMode == "logs" {
+		return true
+	}
+	if a.DetailMode != "summary" {
+		return false
+	}
+	item := a.current()
+	return item != nil && (item.Kind == "volume" || item.Kind == "network")
 }
 
 func wrapLines(lines []string, width int) []string {
